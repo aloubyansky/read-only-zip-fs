@@ -8,28 +8,14 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- *
- * @author Alexey Loubyansky
+ * ZIP-related utils
  */
 public class ZipUtils {
-
-    private static final String JAR_URI_PREFIX = "jar:";
-    private static final Map<String, Object> DEFAULT_OWNER_ENV = new HashMap<>();
-    private static final Map<String, Object> CREATE_ENV = new HashMap<>();
-
-    static {
-        String user = System.getProperty("user.name");
-        DEFAULT_OWNER_ENV.put("defaultOwner", user);
-        DEFAULT_OWNER_ENV.put("defaultGroup", user);
-
-        CREATE_ENV.putAll(DEFAULT_OWNER_ENV);
-        CREATE_ENV.put("create", "true");
-    }
 
     /**
      * Opens a read-only, non-interruptible {@link FileSystem} for the given ZIP/JAR file.
      * <p>
-     * Unlike {@link #newFileSystem(Path)}, this implementation uses
+     * This implementation uses
      * {@link java.io.RandomAccessFile} instead of {@link java.nio.channels.FileChannel},
      * making it immune to thread-interrupt-induced channel closures
      * (<a href="https://bugs.openjdk.org/browse/JDK-8316882">JDK-8316882</a>).
