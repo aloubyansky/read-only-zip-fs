@@ -40,11 +40,16 @@
         <maven.compiler.parameters>true</maven.compiler.parameters>
 
         <junit.jupiter.version>6.0.2</junit.jupiter.version>
-        <quarkus.version>3.15.1</quarkus.version>
 
         <formatter-maven-plugin.version>2.29.0</formatter-maven-plugin.version>
         <impsort-maven-plugin.version>1.12.0</impsort-maven-plugin.version>
         <surefire-plugin.version>3.5.4</surefire-plugin.version>
+
+        <central-publishing-plugin.version>0.9.0</central-publishing-plugin.version>
+        <maven-javadoc-plugin.version>3.11.2</maven-javadoc-plugin.version>
+        <maven-release-plugin.version>3.1.1</maven-release-plugin.version>
+        <maven-source-plugin.version>3.3.1</maven-source-plugin.version>
+        <quarkus-ide-config.version>3.35.2</quarkus-ide-config.version>
 
         <!-- maven-release-plugin -->
         <releaseProfiles>release</releaseProfiles>
@@ -71,7 +76,7 @@
                         <dependency>
                             <artifactId>quarkus-ide-config</artifactId>
                             <groupId>io.quarkus</groupId>
-                            <version>${quarkus.version}</version>
+                            <version>${quarkus-ide-config.version}</version>
                         </dependency>
                     </dependencies>
                     <configuration>
@@ -104,12 +109,6 @@
                 </plugin>
             </plugins>
         </pluginManagement>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-            </plugin>
-        </plugins>
     </build>
 
     <profiles>
