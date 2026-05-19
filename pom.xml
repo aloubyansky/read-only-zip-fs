@@ -4,7 +4,7 @@
 
     <groupId>io.github.aloubyansky.rozip</groupId>
     <artifactId>rozip</artifactId>
-    <version>0.0.1</version>
+    <version>0.0.2-SNAPSHOT</version>
     <packaging>jar</packaging>
     <name>Read-only ZIP FS</name>
 
@@ -29,7 +29,7 @@
         <url>https://github.com/aloubyansky/read-only-zip-fs</url>
         <connection>scm:git:git@github.com:aloubyansky/read-only-zip-fs.git</connection>
         <developerConnection>scm:git:git@github.com:aloubyansky/read-only-zip-fs.git</developerConnection>
-        <tag>0.0.1</tag>
+        <tag>HEAD</tag>
     </scm>
 
     <properties>
