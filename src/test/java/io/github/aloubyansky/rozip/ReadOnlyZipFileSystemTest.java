@@ -895,6 +895,32 @@ class ReadOnlyZipFileSystemTest {
         }
     }
 
+    @Test
+    void deflatedEmptyEntryWithZeroUncompressedSize() throws IOException {
+        Path zip = createZip("test.zip", entry("empty.txt", ""));
+        byte[] raw = Files.readAllBytes(zip);
+        patchCentralDirectoryUncompressedSize(raw, 0);
+        Path patched = tempDir.resolve("empty-zero-size.zip");
+        Files.write(patched, raw);
+
+        try (FileSystem fs = ReadOnlyZipFileSystem.open(patched)) {
+            assertEquals("", Files.readString(fs.getPath("/empty.txt")));
+        }
+    }
+
+    @Test
+    void deflatedEntryWithZeroUncompressedSizeInCentralDirectory() throws IOException {
+        Path zip = createZip("test.zip", entry("hello.txt", "hello world"));
+        byte[] raw = Files.readAllBytes(zip);
+        patchCentralDirectoryUncompressedSize(raw, 0);
+        Path patched = tempDir.resolve("zero-size.zip");
+        Files.write(patched, raw);
+
+        try (FileSystem fs = ReadOnlyZipFileSystem.open(patched)) {
+            assertEquals("hello world", Files.readString(fs.getPath("/hello.txt")));
+        }
+    }
+
     // -- Non-ASCII (UTF-8) entry names --
 
     @Test

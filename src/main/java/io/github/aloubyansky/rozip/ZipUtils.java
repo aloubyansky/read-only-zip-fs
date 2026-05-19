@@ -4,8 +4,6 @@ package io.github.aloubyansky.rozip;
 import java.io.IOException;
 import java.nio.file.FileSystem;
 import java.nio.file.Path;
-import java.util.HashMap;
-import java.util.Map;
 
 /**
  * ZIP-related utils

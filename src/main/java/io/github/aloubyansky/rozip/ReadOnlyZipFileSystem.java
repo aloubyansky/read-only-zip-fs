@@ -1,5 +1,6 @@
 package io.github.aloubyansky.rozip;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.net.URI;
@@ -24,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 import java.util.zip.DataFormatException;
@@ -66,6 +68,7 @@ public class ReadOnlyZipFileSystem extends FileSystem {
     private final ReadOnlyZipPath rootPath;
     private final FileStore fileStore;
     private final AtomicBoolean open = new AtomicBoolean(true);
+    private final ReentrantReadWriteLock closeLock = new ReentrantReadWriteLock();
     private static final int MAX_INFLATER_POOL_SIZE = 8;
     private final Deque<Inflater> inflaterPool = new ArrayDeque<>();
 
@@ -123,14 +126,19 @@ public class ReadOnlyZipFileSystem extends FileSystem {
     @Override
     public void close() throws IOException {
         if (open.compareAndSet(true, false)) {
-            synchronized (raf) {
-                raf.close();
-            }
-            synchronized (inflaterPool) {
-                Inflater inf;
-                while ((inf = inflaterPool.poll()) != null) {
-                    inf.end();
+            closeLock.writeLock().lock();
+            try {
+                synchronized (raf) {
+                    raf.close();
                 }
+                synchronized (inflaterPool) {
+                    Inflater inf;
+                    while ((inf = inflaterPool.poll()) != null) {
+                        inf.end();
+                    }
+                }
+            } finally {
+                closeLock.writeLock().unlock();
             }
         }
     }
@@ -358,17 +366,22 @@ public class ReadOnlyZipFileSystem extends FileSystem {
      * @throws IOException if the entry is a directory or an I/O error occurs
      */
     byte[] readEntryData(String entryName) throws IOException {
-        ensureOpen();
-        ZipEntryInfo info = entries.get(entryName);
-        if (info == null) {
-            throw new NoSuchFileException(entryName);
-        }
-        if (info.directory()) {
-            throw new IOException("Cannot read data from directory entry: " + entryName);
-        }
+        closeLock.readLock().lock();
+        try {
+            ensureOpen();
+            ZipEntryInfo info = entries.get(entryName);
+            if (info == null) {
+                throw new NoSuchFileException(entryName);
+            }
+            if (info.directory()) {
+                throw new IOException("Cannot read data from directory entry: " + entryName);
+            }
 
-        byte[] compressed = readCompressedData(info);
-        return decompress(compressed, info);
+            byte[] compressed = readCompressedData(info);
+            return decompress(compressed, info);
+        } finally {
+            closeLock.readLock().unlock();
+        }
     }
 
     // -- Private implementation --
@@ -382,7 +395,6 @@ public class ReadOnlyZipFileSystem extends FileSystem {
      */
     private byte[] readCompressedData(ZipEntryInfo info) throws IOException {
         synchronized (raf) {
-            ensureOpen();
             raf.seek(info.localHeaderOffset());
             byte[] localHeader = new byte[LOCAL_HEADER_FIXED_SIZE];
             raf.readFully(localHeader);
@@ -459,6 +471,9 @@ public class ReadOnlyZipFileSystem extends FileSystem {
     }
 
     private byte[] inflate(byte[] compressed, int uncompressedSize) throws IOException {
+        if (uncompressedSize == 0) {
+            return inflateDynamic(compressed);
+        }
         Inflater inflater = borrowInflater();
         try {
             inflater.setInput(compressed);
@@ -482,6 +497,45 @@ public class ReadOnlyZipFileSystem extends FileSystem {
                 throw new IOException("Decompressed data exceeds declared size (" + uncompressedSize + ")");
             }
             return result;
+        } catch (DataFormatException e) {
+            throw new IOException("Failed to decompress entry data", e);
+        } finally {
+            returnInflater(inflater);
+        }
+    }
+
+    /**
+     * Inflates compressed data when the uncompressed size is unknown (declared as 0
+     * in the central directory). This occurs with entries written using data descriptors,
+     * where some ZIP tools omit sizes from the central directory header.
+     * <p>
+     * Uses a dynamically-growing buffer instead of pre-allocating, and caps output
+     * at {@link #MAX_ENTRY_SIZE} to guard against zip bombs.
+     *
+     * @param compressed the raw DEFLATE-compressed bytes
+     * @return the decompressed bytes
+     * @throws IOException if decompression fails or the output exceeds {@link #MAX_ENTRY_SIZE}
+     */
+    private byte[] inflateDynamic(byte[] compressed) throws IOException {
+        Inflater inflater = borrowInflater();
+        try {
+            inflater.setInput(compressed);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            while (!inflater.finished()) {
+                int n = inflater.inflate(buf);
+                if (n == 0) {
+                    if (inflater.finished() || inflater.needsDictionary()) {
+                        break;
+                    }
+                    throw new IOException("Inflater stalled; compressed data may be corrupt");
+                }
+                baos.write(buf, 0, n);
+                if (baos.size() > MAX_ENTRY_SIZE) {
+                    throw new IOException("Decompressed data exceeds maximum entry size (" + MAX_ENTRY_SIZE + ")");
+                }
+            }
+            return baos.toByteArray();
         } catch (DataFormatException e) {
             throw new IOException("Failed to decompress entry data", e);
         } finally {
