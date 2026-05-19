@@ -1,0 +1,508 @@
+package io.github.aloubyansky.rozip;
+
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Parses the ZIP central directory from a {@link RandomAccessFile} and produces
+ * an entry index and directory tree.
+ * <p>
+ * The parser handles both standard ZIP and ZIP64 formats. All I/O is performed
+ * through the provided {@link RandomAccessFile}, which is <em>not</em> an
+ * {@link java.nio.channels.InterruptibleChannel} and therefore immune to
+ * thread-interrupt-induced channel closures.
+ * <p>
+ * After construction, the {@link RandomAccessFile} is not accessed by this
+ * class; callers retain ownership of the file handle.
+ * <p>
+ * Entry names are decoded as UTF-8. Archives that use the legacy CP437
+ * encoding (general-purpose bit 11 unset) may produce incorrect names.
+ */
+final class ZipCentralDirectory {
+
+    // ZIP signature constants
+    private static final int EOCD_SIG = 0x06054b50;
+    private static final int ZIP64_EOCD_SIG = 0x06064b50;
+    private static final int ZIP64_EOCD_LOCATOR_SIG = 0x07064b50;
+    private static final int CENTRAL_DIR_SIG = 0x02014b50;
+
+    // EOCD sizes
+    private static final int EOCD_MIN_SIZE = 22;
+    private static final int EOCD_MAX_COMMENT = 65535;
+
+    // Extra field tags
+    private static final int ZIP64_EXTRA_TAG = 0x0001;
+    private static final int NTFS_EXTRA_TAG = 0x000a;
+    private static final int UNIX_EXTRA_TAG = 0x5455;
+
+    // Milliseconds between the Windows FILETIME epoch (1601-01-01) and the Unix epoch (1970-01-01)
+    private static final long WINDOWS_EPOCH_DIFF_MILLIS = 11_644_473_600_000L;
+
+    private static final long MAX_CENTRAL_DIR_SIZE = 256 * 1024 * 1024L; // 256 MB
+
+    private final Map<String, ZipEntryInfo> entries;
+    private final Map<String, List<String>> directoryChildren;
+
+    private ZipCentralDirectory(Map<String, ZipEntryInfo> entries,
+            Map<String, List<String>> directoryChildren) {
+        this.entries = entries;
+        this.directoryChildren = directoryChildren;
+    }
+
+    /**
+     * Parses the central directory of the ZIP file accessible through the given
+     * {@link RandomAccessFile}.
+     *
+     * @param raf an open {@link RandomAccessFile} positioned anywhere; the method
+     *        seeks as needed
+     * @return a parsed central directory containing entry metadata and directory tree
+     * @throws IOException if the file cannot be read or is not a valid ZIP archive
+     */
+    static ZipCentralDirectory parse(RandomAccessFile raf) throws IOException {
+        long fileLength = raf.length();
+        if (fileLength < EOCD_MIN_SIZE) {
+            throw new IOException("File is too small to be a valid ZIP archive");
+        }
+
+        long[] eocdInfo = findEocd(raf, fileLength);
+        long cdOffset = eocdInfo[0];
+        long cdSize = eocdInfo[1];
+        long totalEntries = eocdInfo[2];
+
+        Map<String, ZipEntryInfo> entries = parseEntries(raf, cdOffset, cdSize, totalEntries);
+        Map<String, List<String>> dirChildren = buildDirectoryTree(entries);
+
+        return new ZipCentralDirectory(
+                Collections.unmodifiableMap(entries),
+                Collections.unmodifiableMap(dirChildren));
+    }
+
+    /**
+     * @return unmodifiable map of entry name to entry info
+     */
+    Map<String, ZipEntryInfo> entries() {
+        return entries;
+    }
+
+    /**
+     * @return unmodifiable map of directory name to its immediate children names
+     */
+    Map<String, List<String>> directoryChildren() {
+        return directoryChildren;
+    }
+
+    /**
+     * Locates the End of Central Directory record and extracts the central
+     * directory offset, size, and total entry count. Handles ZIP64 if needed.
+     *
+     * @return array of {@code [cdOffset, cdSize, totalEntries]}
+     */
+    private static long[] findEocd(RandomAccessFile raf, long fileLength) throws IOException {
+        int searchLen = (int) Math.min(fileLength, EOCD_MIN_SIZE + EOCD_MAX_COMMENT);
+        long searchStart = fileLength - searchLen;
+        byte[] buf = new byte[searchLen];
+
+        raf.seek(searchStart);
+        raf.readFully(buf);
+
+        int eocdPos = findEocdSignature(buf);
+        if (eocdPos < 0) {
+            throw new IOException("End of Central Directory signature not found; not a valid ZIP file");
+        }
+
+        long totalEntries = LittleEndian.readUint16(buf, eocdPos + 10);
+        long cdSize = LittleEndian.readUint32(buf, eocdPos + 12);
+        long cdOffset = LittleEndian.readUint32(buf, eocdPos + 16);
+
+        if (needsZip64(totalEntries, cdSize, cdOffset)) {
+            return readZip64Eocd(raf, searchStart + eocdPos);
+        }
+
+        return new long[] { cdOffset, cdSize, totalEntries };
+    }
+
+    /**
+     * Scans the buffer backwards for the EOCD signature {@code PK\x05\x06}.
+     *
+     * @return offset within the buffer, or {@code -1} if not found
+     */
+    private static int findEocdSignature(byte[] buf) {
+        for (int i = buf.length - EOCD_MIN_SIZE; i >= 0; i--) {
+            if (LittleEndian.readInt32(buf, i) == EOCD_SIG) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * @return {@code true} if any EOCD field indicates ZIP64 is needed
+     */
+    private static boolean needsZip64(long totalEntries, long cdSize, long cdOffset) {
+        return totalEntries == 0xFFFFL || cdSize == 0xFFFFFFFFL || cdOffset == 0xFFFFFFFFL;
+    }
+
+    /**
+     * Reads the ZIP64 End of Central Directory record and returns the 64-bit
+     * central directory offset, size, and total entry count.
+     *
+     * @param raf the archive file
+     * @param eocdOffset absolute file offset of the standard EOCD record
+     * @return array of {@code [cdOffset, cdSize, totalEntries]}
+     */
+    private static long[] readZip64Eocd(RandomAccessFile raf, long eocdOffset) throws IOException {
+        long locatorOffset = eocdOffset - 20;
+        if (locatorOffset < 0) {
+            throw new IOException("ZIP64 EOCD locator not found");
+        }
+
+        byte[] locator = new byte[20];
+        raf.seek(locatorOffset);
+        raf.readFully(locator);
+
+        if (LittleEndian.readInt32(locator, 0) != ZIP64_EOCD_LOCATOR_SIG) {
+            throw new IOException("ZIP64 EOCD locator signature mismatch");
+        }
+
+        long zip64EocdOffset = LittleEndian.readUint64(locator, 8);
+
+        byte[] eocd64 = new byte[56];
+        raf.seek(zip64EocdOffset);
+        raf.readFully(eocd64);
+
+        if (LittleEndian.readInt32(eocd64, 0) != ZIP64_EOCD_SIG) {
+            throw new IOException("ZIP64 EOCD signature mismatch");
+        }
+
+        long totalEntries = LittleEndian.readUint64(eocd64, 32);
+        long cdSize = LittleEndian.readUint64(eocd64, 40);
+        long cdOffset = LittleEndian.readUint64(eocd64, 48);
+
+        return new long[] { cdOffset, cdSize, totalEntries };
+    }
+
+    /**
+     * Reads all central directory entries sequentially starting at
+     * {@code cdOffset}.
+     */
+    private static Map<String, ZipEntryInfo> parseEntries(RandomAccessFile raf,
+            long cdOffset, long cdSize, long totalEntries) throws IOException {
+
+        int capacity = (int) Math.min(totalEntries * 4L / 3 + 1, Integer.MAX_VALUE);
+        Map<String, ZipEntryInfo> entries = new LinkedHashMap<>(capacity);
+
+        if (cdSize > MAX_CENTRAL_DIR_SIZE) {
+            throw new IOException("Central directory too large (" + cdSize
+                    + " bytes, limit " + MAX_CENTRAL_DIR_SIZE + ")");
+        }
+        byte[] cdBytes = new byte[(int) cdSize];
+        raf.seek(cdOffset);
+        raf.readFully(cdBytes);
+
+        int pos = 0;
+        for (long i = 0; i < totalEntries && pos + 46 <= cdBytes.length; i++) {
+            if (LittleEndian.readInt32(cdBytes, pos) != CENTRAL_DIR_SIG) {
+                throw new IOException("Invalid central directory entry signature at offset " + (cdOffset + pos));
+            }
+            ZipEntryInfo entry = parseSingleEntry(cdBytes, pos);
+            entries.put(entry.name(), entry);
+            pos += 46 + entryVariableFieldsLength(cdBytes, pos);
+        }
+
+        return entries;
+    }
+
+    /**
+     * Parses a single central directory entry at the given offset within the
+     * central directory byte array.
+     */
+    private static ZipEntryInfo parseSingleEntry(byte[] cd, int pos) {
+        int method = LittleEndian.readUint16(cd, pos + 10);
+        int dosTime = LittleEndian.readUint16(cd, pos + 12);
+        int dosDate = LittleEndian.readUint16(cd, pos + 14);
+        long crc32 = LittleEndian.readUint32(cd, pos + 16);
+        long compressedSize = LittleEndian.readUint32(cd, pos + 20);
+        long uncompressedSize = LittleEndian.readUint32(cd, pos + 24);
+        int nameLen = LittleEndian.readUint16(cd, pos + 28);
+        int extraLen = LittleEndian.readUint16(cd, pos + 30);
+        long localHeaderOffset = LittleEndian.readUint32(cd, pos + 42);
+
+        // UTF-8 assumed; correct for JARs. CP437 detection via general-purpose bit 11 is intentionally omitted.
+        String name = new String(cd, pos + 46, nameLen, StandardCharsets.UTF_8);
+        name = stripLeadingSlash(name);
+
+        boolean isDirectory = name.endsWith("/");
+        if (isDirectory) {
+            name = name.substring(0, name.length() - 1);
+        }
+
+        if (hasZip64Overrides(compressedSize, uncompressedSize, localHeaderOffset)) {
+            long[] zip64 = readZip64Extra(cd, pos + 46 + nameLen, extraLen,
+                    uncompressedSize, compressedSize, localHeaderOffset);
+            uncompressedSize = zip64[0];
+            compressedSize = zip64[1];
+            localHeaderOffset = zip64[2];
+        }
+
+        long lastModified = readTimestampFromExtra(cd, pos + 46 + nameLen, extraLen,
+                dosToEpochMillis(dosDate, dosTime));
+
+        return new ZipEntryInfo(name, compressedSize, uncompressedSize,
+                method, crc32, localHeaderOffset, isDirectory, lastModified);
+    }
+
+    /**
+     * @return the total length of the variable-length fields (name, extra, comment)
+     *         for the central directory entry at {@code pos}
+     */
+    private static int entryVariableFieldsLength(byte[] cd, int pos) {
+        int nameLen = LittleEndian.readUint16(cd, pos + 28);
+        int extraLen = LittleEndian.readUint16(cd, pos + 30);
+        int commentLen = LittleEndian.readUint16(cd, pos + 32);
+        return nameLen + extraLen + commentLen;
+    }
+
+    /**
+     * @return {@code true} if any size or offset field contains the ZIP64
+     *         sentinel value {@code 0xFFFFFFFF}
+     */
+    private static boolean hasZip64Overrides(long compressedSize, long uncompressedSize, long localHeaderOffset) {
+        return compressedSize == 0xFFFFFFFFL
+                || uncompressedSize == 0xFFFFFFFFL
+                || localHeaderOffset == 0xFFFFFFFFL;
+    }
+
+    /**
+     * Reads 64-bit values from the ZIP64 extended information extra field.
+     * <p>
+     * The ZIP64 extra field stores values in order: uncompressed size, compressed
+     * size, local header offset — but only for fields whose standard counterpart
+     * contains the sentinel value {@code 0xFFFFFFFF}.
+     *
+     * @return array of {@code [uncompressedSize, compressedSize, localHeaderOffset]}
+     *         with ZIP64 values replacing any sentinel values
+     */
+    private static long[] readZip64Extra(byte[] extra, int offset, int extraLen,
+            long uncompressedSize, long compressedSize, long localHeaderOffset) {
+        int end = offset + extraLen;
+        int pos = offset;
+        while (pos + 4 <= end) {
+            int tag = LittleEndian.readUint16(extra, pos);
+            int dataSize = LittleEndian.readUint16(extra, pos + 2);
+            if (tag == ZIP64_EXTRA_TAG) {
+                int dataPos = pos + 4;
+                if (uncompressedSize == 0xFFFFFFFFL && dataPos + 8 <= end) {
+                    uncompressedSize = LittleEndian.readUint64(extra, dataPos);
+                    dataPos += 8;
+                }
+                if (compressedSize == 0xFFFFFFFFL && dataPos + 8 <= end) {
+                    compressedSize = LittleEndian.readUint64(extra, dataPos);
+                    dataPos += 8;
+                }
+                if (localHeaderOffset == 0xFFFFFFFFL && dataPos + 8 <= end) {
+                    localHeaderOffset = LittleEndian.readUint64(extra, dataPos);
+                }
+                break;
+            }
+            pos += 4 + dataSize;
+        }
+        return new long[] { uncompressedSize, compressedSize, localHeaderOffset };
+    }
+
+    /**
+     * Scans the extra field for high-precision timestamps. Checks for NTFS
+     * (tag {@code 0x000a}) and Unix extended timestamp (tag {@code 0x5455})
+     * extra fields. Returns the best available last-modified time with
+     * priority: NTFS &gt; Unix extended &gt; DOS fallback.
+     *
+     * @param cd the central directory byte array
+     * @param extraOffset start of the extra field data
+     * @param extraLen length of the extra field
+     * @param dosFallback last-modified time from DOS fields (epoch millis)
+     * @return last-modified time in epoch milliseconds
+     */
+    private static long readTimestampFromExtra(byte[] cd, int extraOffset, int extraLen, long dosFallback) {
+        int end = extraOffset + extraLen;
+        int pos = extraOffset;
+        long ntfsMillis = Long.MIN_VALUE;
+        long unixMillis = Long.MIN_VALUE;
+
+        while (pos + 4 <= end) {
+            int tag = LittleEndian.readUint16(cd, pos);
+            int dataSize = LittleEndian.readUint16(cd, pos + 2);
+            int dataStart = pos + 4;
+            int dataEnd = dataStart + dataSize;
+            if (dataEnd > end) {
+                break;
+            }
+
+            if (tag == NTFS_EXTRA_TAG) {
+                // 4 bytes reserved, then attribute blocks
+                int attrPos = dataStart + 4;
+                while (attrPos + 4 <= dataEnd) {
+                    int attrTag = LittleEndian.readUint16(cd, attrPos);
+                    int attrSize = LittleEndian.readUint16(cd, attrPos + 2);
+                    if (attrTag == 0x0001 && attrSize >= 8 && attrPos + 4 + 8 <= dataEnd) {
+                        long winTime = LittleEndian.readUint64(cd, attrPos + 4);
+                        if (winTime > 0) {
+                            ntfsMillis = winTime / 10_000 - WINDOWS_EPOCH_DIFF_MILLIS;
+                        }
+                        break;
+                    }
+                    attrPos += 4 + attrSize;
+                }
+            } else if (tag == UNIX_EXTRA_TAG && dataSize >= 5) {
+                int flags = cd[dataStart] & 0xFF;
+                if ((flags & 0x01) != 0) {
+                    // Signed 32-bit Unix time, consistent with the JDK
+                    long unixSeconds = LittleEndian.readInt32(cd, dataStart + 1);
+                    unixMillis = unixSeconds * 1000L;
+                }
+            }
+
+            pos = dataEnd;
+        }
+
+        if (ntfsMillis != Long.MIN_VALUE) {
+            return ntfsMillis;
+        }
+        if (unixMillis != Long.MIN_VALUE) {
+            return unixMillis;
+        }
+        return dosFallback;
+    }
+
+    /**
+     * Builds the directory tree from the parsed entries.
+     * <p>
+     * Creates implicit directory entries for any parent paths not explicitly
+     * present in the archive. The root directory is keyed by the empty string
+     * {@code ""}.
+     */
+    private static Map<String, List<String>> buildDirectoryTree(Map<String, ZipEntryInfo> entries) {
+        Map<String, Set<String>> tree = new HashMap<>();
+        tree.put(ZipEntryInfo.ROOT_ENTRY_NAME, new LinkedHashSet<>());
+
+        for (Map.Entry<String, ZipEntryInfo> e : entries.entrySet()) {
+            String name = e.getKey();
+            ensureParentDirs(tree, name);
+            if (e.getValue().directory()) {
+                tree.computeIfAbsent(name, k -> new LinkedHashSet<>());
+            }
+            addChildToParent(tree, name);
+        }
+
+        Map<String, List<String>> result = new HashMap<>(tree.size());
+        tree.forEach((k, v) -> {
+            List<String> children = Collections.unmodifiableList(new ArrayList<>(v));
+            result.put(k, children);
+        });
+        return result;
+    }
+
+    /**
+     * Ensures all ancestor directories of the given entry name exist in the
+     * directory tree. For example, for entry {@code "a/b/c.txt"}, ensures
+     * directories {@code "a"} and {@code "a/b"} are present.
+     */
+    private static void ensureParentDirs(Map<String, Set<String>> tree, String name) {
+        int idx = 0;
+        while ((idx = name.indexOf('/', idx)) >= 0) {
+            String dir = name.substring(0, idx);
+            if (!tree.containsKey(dir)) {
+                tree.put(dir, new LinkedHashSet<>());
+                addChildToParent(tree, dir);
+            }
+            idx++;
+        }
+    }
+
+    /**
+     * Adds the given entry as a child of its immediate parent directory in the
+     * directory tree.
+     */
+    private static void addChildToParent(Map<String, Set<String>> tree, String name) {
+        String parentKey = parentDirKey(name);
+        Set<String> siblings = tree.get(parentKey);
+        if (siblings != null) {
+            String childName = childNameWithinParent(name, parentKey);
+            if (!childName.isEmpty()) {
+                siblings.add(childName);
+            }
+        }
+    }
+
+    /**
+     * Returns the parent directory key for the given entry name.
+     * <p>
+     * For {@code "a/b/c.txt"} returns {@code "a/b"}.
+     * For {@code "a/b"} returns {@code "a"}.
+     * For {@code "top.txt"} returns {@code ""} (root).
+     */
+    private static String parentDirKey(String name) {
+        int lastSlash = name.lastIndexOf('/');
+        return lastSlash < 0 ? ZipEntryInfo.ROOT_ENTRY_NAME : name.substring(0, lastSlash);
+    }
+
+    /**
+     * Extracts the child name relative to the parent directory.
+     * <p>
+     * For name {@code "a/b/c.txt"} and parent {@code "a/b"}, returns
+     * {@code "c.txt"}.
+     * For name {@code "a/b"} and parent {@code "a"}, returns {@code "b"}.
+     */
+    private static String childNameWithinParent(String name, String parentKey) {
+        int start = parentKey.isEmpty() ? 0 : parentKey.length() + 1;
+        return name.substring(start);
+    }
+
+    /**
+     * Strips a leading {@code /} from the name if present.
+     */
+    private static String stripLeadingSlash(String name) {
+        return name.startsWith("/") ? name.substring(1) : name;
+    }
+
+    /**
+     * Converts DOS date and time fields to epoch milliseconds.
+     *
+     * @param dosDate DOS-format date (bits: 15-9 = year-1980, 8-5 = month, 4-0 = day)
+     * @param dosTime DOS-format time (bits: 15-11 = hour, 10-5 = minute, 4-0 = second/2)
+     * @return epoch milliseconds in the system default time zone
+     */
+    private static long dosToEpochMillis(int dosDate, int dosTime) {
+        int year = ((dosDate >> 9) & 0x7F) + 1980;
+        int month = (dosDate >> 5) & 0x0F;
+        int day = dosDate & 0x1F;
+        int hour = (dosTime >> 11) & 0x1F;
+        int minute = (dosTime >> 5) & 0x3F;
+        int second = (dosTime & 0x1F) * 2;
+
+        if (month < 1)
+            month = 1;
+        if (day < 1)
+            day = 1;
+
+        try {
+            // System default timezone, consistent with JDK's ZipFileSystem
+            return LocalDateTime.of(year, month, day, hour, minute, second)
+                    .atZone(ZoneId.systemDefault())
+                    .toInstant()
+                    .toEpochMilli();
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
+}
