@@ -67,31 +67,40 @@ class ReadOnlyZipPath implements Path {
         if (path.isEmpty()) {
             return this;
         }
-        if (path.equals("/")) {
-            return null;
+
+        int lastSlash = path.lastIndexOf('/');
+        if (lastSlash == -1) {
+            return this;
         }
-        String stripped = stripTrailingSlash(path);
-        int lastSlash = stripped.lastIndexOf('/');
-        if (lastSlash < 0) {
-            return isAbsolute() ? new ReadOnlyZipPath(fileSystem, stripped) : this;
+        final int length = path.length();
+        if (lastSlash == 0) {
+            return length == 1 ? null : new ReadOnlyZipPath(fileSystem, path.substring(1));
         }
-        return new ReadOnlyZipPath(fileSystem, stripped.substring(lastSlash + 1));
+        if (lastSlash == length - 1) {
+            lastSlash = path.lastIndexOf('/', lastSlash - 1);
+            return lastSlash == -1 ? new ReadOnlyZipPath(fileSystem, path.substring(0, length - 1))
+                    : new ReadOnlyZipPath(fileSystem, path.substring(lastSlash + 1, length - 1));
+        }
+        return new ReadOnlyZipPath(fileSystem, path.substring(lastSlash + 1));
     }
 
     @Override
     public Path getParent() {
-        String stripped = stripTrailingSlash(path);
-        if (stripped.isEmpty() || stripped.equals("/")) {
+        if (path.isEmpty() || path.equals("/")) {
             return null;
         }
-        int lastSlash = stripped.lastIndexOf('/');
+        int end = path.length();
+        if (path.charAt(end - 1) == '/') {
+            end--;
+        }
+        int lastSlash = path.lastIndexOf('/', end - 1);
         if (lastSlash < 0) {
             return null;
         }
         if (lastSlash == 0) {
             return fileSystem.getRootPath();
         }
-        return new ReadOnlyZipPath(fileSystem, stripped.substring(0, lastSlash));
+        return new ReadOnlyZipPath(fileSystem, path.substring(0, lastSlash));
     }
 
     @Override
@@ -114,6 +123,9 @@ class ReadOnlyZipPath implements Path {
         if (beginIndex < 0 || beginIndex >= offs.length
                 || endIndex <= beginIndex || endIndex > offs.length) {
             throw new IllegalArgumentException("subpath(" + beginIndex + ", " + endIndex + ")");
+        }
+        if (endIndex - beginIndex == 1) {
+            return new ReadOnlyZipPath(fileSystem, componentAt(offs, beginIndex));
         }
         StringBuilder sb = new StringBuilder();
         for (int i = beginIndex; i < endIndex; i++) {
@@ -141,7 +153,7 @@ class ReadOnlyZipPath implements Path {
             return true;
         }
         for (int i = 0; i < otherOffs.length; i++) {
-            if (!componentAt(thisOffs, i).equals(o.componentAt(otherOffs, i))) {
+            if (!componentEquals(thisOffs, i, o, otherOffs, i)) {
                 return false;
             }
         }
@@ -169,7 +181,7 @@ class ReadOnlyZipPath implements Path {
         }
         int diff = thisOffs.length - otherOffs.length;
         for (int i = otherOffs.length - 1; i >= 0; i--) {
-            if (!componentAt(thisOffs, diff + i).equals(o.componentAt(otherOffs, i))) {
+            if (!componentEquals(thisOffs, diff + i, o, otherOffs, i)) {
                 return false;
             }
         }
@@ -183,6 +195,9 @@ class ReadOnlyZipPath implements Path {
 
     @Override
     public Path normalize() {
+        if (path.indexOf('.') < 0) {
+            return this;
+        }
         int[] offs = getOffsets();
         if (offs.length == 0) {
             return this;
@@ -391,12 +406,13 @@ class ReadOnlyZipPath implements Path {
 
     @Override
     public boolean equals(Object obj) {
-        if (this == obj)
+        if (this == obj) {
             return true;
-        if (!(obj instanceof ReadOnlyZipPath))
-            return false;
-        ReadOnlyZipPath other = (ReadOnlyZipPath) obj;
-        return fileSystem == other.fileSystem && path.equals(other.path);
+        }
+        if (obj instanceof ReadOnlyZipPath other) {
+            return fileSystem == other.fileSystem && path.equals(other.path);
+        }
+        return false;
     }
 
     @Override
@@ -408,8 +424,6 @@ class ReadOnlyZipPath implements Path {
     public String toString() {
         return path;
     }
-
-    // -- Internal helpers --
 
     /**
      * Lazily computes the offsets of each name component in the path string.
@@ -430,47 +444,72 @@ class ReadOnlyZipPath implements Path {
      * component in the path string, after skipping the leading {@code "/"}.
      */
     private int[] computeOffsets() {
-        String stripped = stripTrailingSlash(path);
-        if (stripped.isEmpty() || stripped.equals("/")) {
+        int len = path.length();
+        if (len > 1 && path.charAt(len - 1) == '/') {
+            len--;
+        }
+        if (len == 0 || (len == 1 && path.charAt(0) == '/')) {
             return new int[0];
         }
-        int start = stripped.startsWith("/") ? 1 : 0;
+        int start = path.charAt(0) == '/' ? 1 : 0;
         int count = 1;
-        for (int i = start; i < stripped.length(); i++) {
-            if (stripped.charAt(i) == '/') {
+        for (int i = start; i < len; i++) {
+            if (path.charAt(i) == '/') {
                 count++;
             }
         }
         int[] offs = new int[count];
         int idx = 0;
         offs[idx++] = start;
-        for (int i = start; i < stripped.length(); i++) {
-            if (stripped.charAt(i) == '/') {
+        for (int i = start; i < len; i++) {
+            if (path.charAt(i) == '/') {
                 offs[idx++] = i + 1;
             }
         }
         return offs;
     }
 
+    private int pathLengthWithoutTrailingSlash() {
+        int len = path.length();
+        return (len > 1 && path.charAt(len - 1) == '/') ? len - 1 : len;
+    }
+
     /**
      * Returns the name component at the given index using precomputed offsets.
      */
     private String componentAt(int[] offs, int index) {
-        String stripped = stripTrailingSlash(path);
-        int begin = offs[index];
-        int end = (index + 1 < offs.length) ? offs[index + 1] - 1 : stripped.length();
-        return stripped.substring(begin, end);
+        return path.substring(componentStart(offs, index), componentEnd(offs, index));
     }
 
     /**
-     * Strips a single trailing {@code /} if present and the string is not
-     * {@code "/"} itself.
+     * @return the start index (inclusive) of the component at {@code index}
      */
-    private static String stripTrailingSlash(String s) {
-        if (s.length() > 1 && s.endsWith("/")) {
-            return s.substring(0, s.length() - 1);
+    private int componentStart(int[] offs, int index) {
+        return offs[index];
+    }
+
+    /**
+     * @return the end index (exclusive) of the component at {@code index}
+     */
+    private int componentEnd(int[] offs, int index) {
+        return (index + 1 < offs.length) ? offs[index + 1] - 1 : pathLengthWithoutTrailingSlash();
+    }
+
+    /**
+     * Compares a component of this path with a component of another path
+     * without allocating substrings.
+     */
+    private boolean componentEquals(int[] thisOffs, int thisIndex,
+            ReadOnlyZipPath other, int[] otherOffs, int otherIndex) {
+        int thisStart = componentStart(thisOffs, thisIndex);
+        int thisEnd = componentEnd(thisOffs, thisIndex);
+        int otherStart = other.componentStart(otherOffs, otherIndex);
+        int otherEnd = other.componentEnd(otherOffs, otherIndex);
+        int len = thisEnd - thisStart;
+        if (len != otherEnd - otherStart) {
+            return false;
         }
-        return s;
+        return path.regionMatches(thisStart, other.path, otherStart, len);
     }
 
     /**
@@ -481,10 +520,10 @@ class ReadOnlyZipPath implements Path {
      */
     private ReadOnlyZipPath requireSameFs(Path other) {
         Objects.requireNonNull(other);
-        if (!(other instanceof ReadOnlyZipPath)) {
-            throw new ProviderMismatchException("Expected ReadOnlyZipPath but got " + other.getClass().getName());
+        if (other instanceof ReadOnlyZipPath o) {
+            return o;
         }
-        return (ReadOnlyZipPath) other;
+        throw new ProviderMismatchException("Expected ReadOnlyZipPath but got " + other.getClass().getName());
     }
 
     /**
@@ -494,8 +533,7 @@ class ReadOnlyZipPath implements Path {
      * @return the cast path, or {@code null} if incompatible
      */
     private ReadOnlyZipPath toReadOnlyZipPath(Path other) {
-        if (other instanceof ReadOnlyZipPath) {
-            ReadOnlyZipPath o = (ReadOnlyZipPath) other;
+        if (other instanceof ReadOnlyZipPath o) {
             if (o.fileSystem == this.fileSystem) {
                 return o;
             }

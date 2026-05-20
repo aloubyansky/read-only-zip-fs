@@ -1,6 +1,5 @@
 package io.github.aloubyansky.rozip;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.net.URI;
@@ -12,20 +11,17 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.PathMatcher;
 import java.nio.file.WatchService;
-import java.nio.file.attribute.BasicFileAttributeView;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.nio.file.attribute.FileAttributeView;
-import java.nio.file.attribute.FileStoreAttributeView;
 import java.nio.file.attribute.UserPrincipalLookupService;
 import java.nio.file.spi.FileSystemProvider;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 import java.util.zip.DataFormatException;
@@ -55,6 +51,7 @@ public class ReadOnlyZipFileSystem extends FileSystem {
 
     private static final int LOCAL_HEADER_SIG = 0x04034b50;
     private static final int LOCAL_HEADER_FIXED_SIZE = 30;
+    private static final int DATA_DESCRIPTOR_SIG = 0x08074b50;
     private static final int METHOD_STORED = 0;
     private static final int METHOD_DEFLATED = 8;
 
@@ -68,7 +65,6 @@ public class ReadOnlyZipFileSystem extends FileSystem {
     private final ReadOnlyZipPath rootPath;
     private final FileStore fileStore;
     private final AtomicBoolean open = new AtomicBoolean(true);
-    private final ReentrantReadWriteLock closeLock = new ReentrantReadWriteLock();
     private static final int MAX_INFLATER_POOL_SIZE = 8;
     private final Deque<Inflater> inflaterPool = new ArrayDeque<>();
 
@@ -101,6 +97,13 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Constructs a new filesystem backed by the given archive file.
+     *
+     * @param zipPath path to the ZIP/JAR file on the default filesystem
+     * @param raf an open file handle for reading entry data
+     * @param cd the parsed central directory
+     */
     private ReadOnlyZipFileSystem(Path zipPath, RandomAccessFile raf, ZipCentralDirectory cd) {
         this.zipPath = zipPath;
         this.raf = raf;
@@ -110,8 +113,9 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         this.fileStore = new ReadOnlyZipFileStore(zipPath);
     }
 
-    // -- FileSystem methods --
-
+    /**
+     * @return the singleton {@link ReadOnlyZipFileSystemProvider}
+     */
     @Override
     public FileSystemProvider provider() {
         return ReadOnlyZipFileSystemProvider.INSTANCE;
@@ -126,23 +130,21 @@ public class ReadOnlyZipFileSystem extends FileSystem {
     @Override
     public void close() throws IOException {
         if (open.compareAndSet(true, false)) {
-            closeLock.writeLock().lock();
-            try {
-                synchronized (raf) {
-                    raf.close();
+            synchronized (raf) {
+                raf.close();
+            }
+            synchronized (inflaterPool) {
+                Inflater inf;
+                while ((inf = inflaterPool.poll()) != null) {
+                    inf.end();
                 }
-                synchronized (inflaterPool) {
-                    Inflater inf;
-                    while ((inf = inflaterPool.poll()) != null) {
-                        inf.end();
-                    }
-                }
-            } finally {
-                closeLock.writeLock().unlock();
             }
         }
     }
 
+    /**
+     * @return {@code true} if this filesystem has not been {@linkplain #close() closed}
+     */
     @Override
     public boolean isOpen() {
         return open.get();
@@ -164,16 +166,25 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         return "/";
     }
 
+    /**
+     * @return a single-element iterable containing the root path {@code "/"}
+     */
     @Override
     public Iterable<Path> getRootDirectories() {
         return Collections.singletonList(rootPath);
     }
 
+    /**
+     * @return a single-element iterable containing this archive's {@link FileStore}
+     */
     @Override
     public Iterable<FileStore> getFileStores() {
         return Collections.singletonList(fileStore);
     }
 
+    /**
+     * @return the {@link FileStore} representing this archive
+     */
     FileStore getFileStore() {
         return fileStore;
     }
@@ -197,6 +208,9 @@ public class ReadOnlyZipFileSystem extends FileSystem {
     @Override
     public Path getPath(String first, String... more) {
         ensureOpen();
+        if (more.length == 0) {
+            return new ReadOnlyZipPath(this, first);
+        }
         StringBuilder sb = new StringBuilder(first);
         for (String s : more) {
             if (!sb.isEmpty() && sb.charAt(sb.length() - 1) != '/') {
@@ -254,12 +268,13 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         throw new UnsupportedOperationException("WatchService not supported");
     }
 
+    /**
+     * @return the string form of the path to the underlying ZIP file
+     */
     @Override
     public String toString() {
         return zipPath.toString();
     }
-
-    // -- Package-private accessors used by the provider --
 
     /**
      * @return the cached root path {@code "/"}
@@ -299,10 +314,7 @@ public class ReadOnlyZipFileSystem extends FileSystem {
      */
     ZipEntryInfo getEntryInfo(String entryName) {
         ensureOpen();
-        if (ZipEntryInfo.ROOT_ENTRY_NAME.equals(entryName)) {
-            return null;
-        }
-        return entries.get(entryName);
+        return ZipEntryInfo.ROOT_ENTRY_NAME.equals(entryName) ? null : entries.get(entryName);
     }
 
     /**
@@ -325,10 +337,9 @@ public class ReadOnlyZipFileSystem extends FileSystem {
      */
     boolean entryExists(String entryName) {
         ensureOpen();
-        if (ZipEntryInfo.ROOT_ENTRY_NAME.equals(entryName)) {
-            return true;
-        }
-        return entries.containsKey(entryName) || directoryChildren.containsKey(entryName);
+        return ZipEntryInfo.ROOT_ENTRY_NAME.equals(entryName)
+                || entries.containsKey(entryName)
+                || directoryChildren.containsKey(entryName);
     }
 
     /**
@@ -366,25 +377,30 @@ public class ReadOnlyZipFileSystem extends FileSystem {
      * @throws IOException if the entry is a directory or an I/O error occurs
      */
     byte[] readEntryData(String entryName) throws IOException {
-        closeLock.readLock().lock();
-        try {
-            ensureOpen();
-            ZipEntryInfo info = entries.get(entryName);
-            if (info == null) {
-                throw new NoSuchFileException(entryName);
-            }
-            if (info.directory()) {
-                throw new IOException("Cannot read data from directory entry: " + entryName);
-            }
-
-            byte[] compressed = readCompressedData(info);
-            return decompress(compressed, info);
-        } finally {
-            closeLock.readLock().unlock();
+        ensureOpen();
+        ZipEntryInfo info = entries.get(entryName);
+        if (info == null) {
+            throw new NoSuchFileException(entryName);
         }
+        if (info.directory()) {
+            throw new IOException("Cannot read data from directory entry: " + entryName);
+        }
+
+        CompressedEntry ce = readCompressedData(info);
+        return decompress(ce, info);
     }
 
-    // -- Private implementation --
+    /**
+     * Holds the compressed bytes read from the archive together with the
+     * best-known uncompressed size resolved from the local file header or
+     * data descriptor.
+     *
+     * @param data the raw (possibly compressed) entry bytes
+     * @param uncompressedSize uncompressed size from the local header or data
+     *        descriptor, or 0 if neither source provided it
+     */
+    private record CompressedEntry(byte[] data, long uncompressedSize) {
+    }
 
     /**
      * Reads the compressed data bytes for an entry from the archive.
@@ -392,14 +408,29 @@ public class ReadOnlyZipFileSystem extends FileSystem {
      * Seeks to the local file header, reads it to determine the actual data
      * offset (which may differ from the central directory due to differing
      * extra field lengths), then reads the compressed data.
+     * <p>
+     * Also resolves the uncompressed size when the central directory reports 0.
+     * The local header (offset 22) is checked first. If it is also 0 and the
+     * general-purpose bit 3 is set (data descriptor present), the data
+     * descriptor immediately following the compressed data is read to obtain
+     * the actual uncompressed size. This lets {@link #decompress} use the
+     * efficient pre-allocated inflate path in virtually all cases.
+     *
+     * @param info the entry metadata from the central directory
+     * @return compressed bytes together with the resolved uncompressed size
+     * @throws IOException if the file cannot be read or the local header is invalid
      */
-    private byte[] readCompressedData(ZipEntryInfo info) throws IOException {
+    private CompressedEntry readCompressedData(ZipEntryInfo info) throws IOException {
+        // ensureOpen inside synchronized(raf) guarantees the file handle cannot
+        // be closed between the check and the reads — close() also syncs on raf
         synchronized (raf) {
+            ensureOpen();
             raf.seek(info.localHeaderOffset());
             byte[] localHeader = new byte[LOCAL_HEADER_FIXED_SIZE];
             raf.readFully(localHeader);
             validateLocalHeader(localHeader, info);
 
+            long localUncompressedSize = LittleEndian.readUint32(localHeader, 22);
             int nameLen = LittleEndian.readUint16(localHeader, 26);
             int extraLen = LittleEndian.readUint16(localHeader, 28);
             long dataOffset = info.localHeaderOffset() + LOCAL_HEADER_FIXED_SIZE + nameLen + extraLen;
@@ -407,8 +438,36 @@ public class ReadOnlyZipFileSystem extends FileSystem {
             raf.seek(dataOffset);
             byte[] compressed = new byte[checkedCast(info.compressedSize())];
             raf.readFully(compressed);
-            return compressed;
+
+            long uncompressedSize = localUncompressedSize;
+            if (uncompressedSize == 0 && info.uncompressedSize() == 0) {
+                int flags = LittleEndian.readUint16(localHeader, 6);
+                if ((flags & 0x08) != 0) {
+                    uncompressedSize = readDataDescriptorUncompressedSize();
+                }
+            }
+
+            return new CompressedEntry(compressed, uncompressedSize);
         }
+    }
+
+    /**
+     * Reads the uncompressed size from a data descriptor at the current
+     * file position. Handles both the variant with a leading signature
+     * ({@code 0x08074b50}) and the variant without.
+     *
+     * @return the uncompressed size from the data descriptor
+     * @throws IOException if the descriptor cannot be read
+     */
+    private long readDataDescriptorUncompressedSize() throws IOException {
+        byte[] desc = new byte[16];
+        raf.readFully(desc);
+        if (LittleEndian.readInt32(desc, 0) == DATA_DESCRIPTOR_SIG) {
+            // signature(4) + crc32(4) + compressedSize(4) + uncompressedSize(4)
+            return LittleEndian.readUint32(desc, 12);
+        }
+        // no signature: crc32(4) + compressedSize(4) + uncompressedSize(4)
+        return LittleEndian.readUint32(desc, 8);
     }
 
     /**
@@ -423,20 +482,32 @@ public class ReadOnlyZipFileSystem extends FileSystem {
 
     /**
      * Decompresses entry data according to its compression method.
+     * <p>
+     * For DEFLATED entries, uses the uncompressed size from the central
+     * directory when available, otherwise falls back to the size resolved
+     * by {@link #readCompressedData} (from the local header or data
+     * descriptor). Genuinely empty entries (uncompressed size and CRC both
+     * 0) are returned immediately without inflating.
      *
-     * @param compressed the raw (possibly compressed) bytes
-     * @param info the entry metadata
+     * @param ce the compressed bytes and resolved uncompressed size
+     * @param info the entry metadata from the central directory
      * @return the uncompressed bytes
-     * @throws IOException if decompression fails or the compression method is
-     *         unsupported
+     * @throws IOException if decompression fails or the method is unsupported
      */
-    private byte[] decompress(byte[] compressed, ZipEntryInfo info) throws IOException {
+    private byte[] decompress(CompressedEntry ce, ZipEntryInfo info) throws IOException {
         validateEntrySize(info);
         byte[] result;
         if (info.compressionMethod() == METHOD_STORED) {
-            result = compressed;
+            result = ce.data();
         } else if (info.compressionMethod() == METHOD_DEFLATED) {
-            result = inflate(compressed, checkedCast(info.uncompressedSize()));
+            long uncompressedSize = info.uncompressedSize();
+            if (uncompressedSize == 0 && ce.uncompressedSize() > 0) {
+                uncompressedSize = ce.uncompressedSize();
+            }
+            if (uncompressedSize == 0 && info.crc32() == 0) {
+                return new byte[0];
+            }
+            result = inflate(ce.data(), checkedCast(uncompressedSize));
         } else {
             throw new IOException("Unsupported compression method " + info.compressionMethod()
                     + " for entry: " + info.name());
@@ -445,6 +516,13 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         return result;
     }
 
+    /**
+     * Validates that the entry's compressed and uncompressed sizes are within
+     * limits and that the compression ratio is not suspiciously high.
+     *
+     * @param info the entry metadata
+     * @throws IOException if any size check fails
+     */
     private static void validateEntrySize(ZipEntryInfo info) throws IOException {
         if (info.uncompressedSize() > MAX_ENTRY_SIZE) {
             throw new IOException("Entry too large (uncompressed " + info.uncompressedSize()
@@ -460,6 +538,14 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Verifies that the CRC-32 of the decompressed data matches the value
+     * recorded in the central directory.
+     *
+     * @param data the decompressed entry bytes
+     * @param info the entry metadata containing the expected CRC-32
+     * @throws IOException if the checksums do not match
+     */
     private static void verifyCrc32(byte[] data, ZipEntryInfo info) throws IOException {
         CRC32 crc = new CRC32();
         crc.update(data);
@@ -470,8 +556,22 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Inflates DEFLATE-compressed data into a pre-allocated buffer.
+     * <p>
+     * When {@code uncompressedSize} is 0 (unknown), delegates to
+     * {@link #inflateDynamic(byte[])} which uses a dynamically-growing buffer.
+     *
+     * @param compressed the raw DEFLATE-compressed bytes
+     * @param uncompressedSize the expected decompressed size, or 0 if unknown
+     * @return the decompressed bytes
+     * @throws IOException if decompression fails or the actual size does not
+     *         match the declared size
+     */
     private byte[] inflate(byte[] compressed, int uncompressedSize) throws IOException {
         if (uncompressedSize == 0) {
+            // this shouldn't happen for a spec compliant ZIP, this is a defensive measure
+            // matching the default ZipFileSystem implementation
             return inflateDynamic(compressed);
         }
         Inflater inflater = borrowInflater();
@@ -505,12 +605,17 @@ public class ReadOnlyZipFileSystem extends FileSystem {
     }
 
     /**
-     * Inflates compressed data when the uncompressed size is unknown (declared as 0
-     * in the central directory). This occurs with entries written using data descriptors,
-     * where some ZIP tools omit sizes from the central directory header.
+     * Inflates compressed data when the uncompressed size is unknown (reported
+     * as 0 in both the central directory and local file header). This occurs
+     * with entries written using data descriptors, where some ZIP tools omit
+     * sizes from both headers.
      * <p>
-     * Uses a dynamically-growing buffer instead of pre-allocating, and caps output
-     * at {@link #MAX_ENTRY_SIZE} to guard against zip bombs.
+     * Inflates directly into a dynamically-growing {@code byte[]} rather than
+     * through a {@link java.io.ByteArrayOutputStream} with an intermediate
+     * buffer, so each decompressed byte is written once into the result array
+     * instead of being copied twice (intermediate buffer to BAOS, then
+     * {@code toByteArray()}). Output is capped at {@link #MAX_ENTRY_SIZE} to
+     * guard against zip bombs.
      *
      * @param compressed the raw DEFLATE-compressed bytes
      * @return the decompressed bytes
@@ -520,22 +625,27 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         Inflater inflater = borrowInflater();
         try {
             inflater.setInput(compressed);
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
+            int capacity = Math.max(compressed.length * 2, 256);
+            byte[] result = new byte[capacity];
+            int offset = 0;
             while (!inflater.finished()) {
-                int n = inflater.inflate(buf);
+                if (offset == result.length) {
+                    int newCap = (int) Math.min((long) result.length * 2, MAX_ENTRY_SIZE + 1);
+                    result = Arrays.copyOf(result, newCap);
+                }
+                int n = inflater.inflate(result, offset, result.length - offset);
                 if (n == 0) {
                     if (inflater.finished() || inflater.needsDictionary()) {
                         break;
                     }
                     throw new IOException("Inflater stalled; compressed data may be corrupt");
                 }
-                baos.write(buf, 0, n);
-                if (baos.size() > MAX_ENTRY_SIZE) {
+                offset += n;
+                if (offset > MAX_ENTRY_SIZE) {
                     throw new IOException("Decompressed data exceeds maximum entry size (" + MAX_ENTRY_SIZE + ")");
                 }
             }
-            return baos.toByteArray();
+            return (offset == result.length) ? result : Arrays.copyOf(result, offset);
         } catch (DataFormatException e) {
             throw new IOException("Failed to decompress entry data", e);
         } finally {
@@ -543,6 +653,12 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Returns a pooled {@link Inflater} configured for raw DEFLATE (no
+     * zlib header), or creates a new one if the pool is empty.
+     *
+     * @return an {@link Inflater} ready for use
+     */
     private Inflater borrowInflater() {
         synchronized (inflaterPool) {
             Inflater inf = inflaterPool.poll();
@@ -553,10 +669,16 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         return new Inflater(true);
     }
 
+    /**
+     * Returns an {@link Inflater} to the pool after use. If the filesystem
+     * is closed or the pool is full, the inflater is ended instead.
+     *
+     * @param inf the inflater to return
+     */
     private void returnInflater(Inflater inf) {
-        inf.reset();
         synchronized (inflaterPool) {
             if (open.get() && inflaterPool.size() < MAX_INFLATER_POOL_SIZE) {
+                inf.reset();
                 inflaterPool.push(inf);
                 return;
             }
@@ -676,66 +798,5 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         }
         regex.append('$');
         return regex.toString();
-    }
-
-    // -- FileStore implementation --
-
-    static class ReadOnlyZipFileStore extends FileStore {
-
-        private final Path zipPath;
-
-        ReadOnlyZipFileStore(Path zipPath) {
-            this.zipPath = zipPath;
-        }
-
-        @Override
-        public String name() {
-            return zipPath.toString();
-        }
-
-        @Override
-        public String type() {
-            return "zip";
-        }
-
-        @Override
-        public boolean isReadOnly() {
-            return true;
-        }
-
-        @Override
-        public long getTotalSpace() throws IOException {
-            return java.nio.file.Files.size(zipPath);
-        }
-
-        @Override
-        public long getUsableSpace() {
-            return 0;
-        }
-
-        @Override
-        public long getUnallocatedSpace() {
-            return 0;
-        }
-
-        @Override
-        public boolean supportsFileAttributeView(Class<? extends FileAttributeView> type) {
-            return type == BasicFileAttributeView.class;
-        }
-
-        @Override
-        public boolean supportsFileAttributeView(String name) {
-            return "basic".equals(name);
-        }
-
-        @Override
-        public <V extends FileStoreAttributeView> V getFileStoreAttributeView(Class<V> type) {
-            return null;
-        }
-
-        @Override
-        public Object getAttribute(String attribute) throws IOException {
-            throw new UnsupportedOperationException("Attribute " + attribute + " not supported");
-        }
     }
 }

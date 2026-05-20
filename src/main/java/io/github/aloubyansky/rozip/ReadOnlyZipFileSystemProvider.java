@@ -26,8 +26,8 @@ import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.FileAttributeView;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.spi.FileSystemProvider;
+import java.util.HashMap;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
@@ -65,8 +65,6 @@ class ReadOnlyZipFileSystemProvider extends FileSystemProvider {
         return "jar";
     }
 
-    // -- Unsupported factory methods (filesystems are created via ReadOnlyZipFileSystem.open) --
-
     /**
      * @throws UnsupportedOperationException always; use
      *         {@link ReadOnlyZipFileSystem#open(Path)} instead
@@ -92,8 +90,6 @@ class ReadOnlyZipFileSystemProvider extends FileSystemProvider {
     public Path getPath(URI uri) {
         throw new UnsupportedOperationException("Use ReadOnlyZipFileSystem.getPath(String)");
     }
-
-    // -- Read operations --
 
     /**
      * Opens an {@link InputStream} to read the contents of the specified entry.
@@ -299,8 +295,6 @@ class ReadOnlyZipFileSystemProvider extends FileSystemProvider {
         return toFs(path).getFileStore();
     }
 
-    // -- Write operations (all throw ReadOnlyFileSystemException) --
-
     /** @throws ReadOnlyFileSystemException always */
     @Override
     public void createDirectory(Path dir, FileAttribute<?>... attrs) throws IOException {
@@ -332,13 +326,11 @@ class ReadOnlyZipFileSystemProvider extends FileSystemProvider {
         throw new ReadOnlyFileSystemException();
     }
 
-    // -- Internal helpers --
-
     /**
      * Extracts the {@link ReadOnlyZipFileSystem} from the given path.
      */
     private static ReadOnlyZipFileSystem toFs(Path path) {
-        return (ReadOnlyZipFileSystem) ((ReadOnlyZipPath) path).getFileSystem();
+        return (ReadOnlyZipFileSystem) path.getFileSystem();
     }
 
     /**
@@ -352,16 +344,16 @@ class ReadOnlyZipFileSystemProvider extends FileSystemProvider {
      */
     private static String toEntryName(Path path) {
         String s = path.toAbsolutePath().normalize().toString();
-        if (s.equals("/")) {
-            return ZipEntryInfo.ROOT_ENTRY_NAME;
+        if (s.isEmpty()) {
+            return s;
         }
-        if (s.startsWith("/")) {
-            s = s.substring(1);
+        if (s.charAt(0) == '/') {
+            if (s.length() == 1) {
+                return ZipEntryInfo.ROOT_ENTRY_NAME;
+            }
+            return s.charAt(s.length() - 1) == '/' ? s.substring(1, s.length() - 1) : s.substring(1);
         }
-        if (s.endsWith("/")) {
-            s = s.substring(0, s.length() - 1);
-        }
-        return s;
+        return s.charAt(s.length() - 1) == '/' ? s.substring(0, s.length() - 1) : s;
     }
 
     /**
@@ -406,8 +398,8 @@ class ReadOnlyZipFileSystemProvider extends FileSystemProvider {
             throw new UnsupportedOperationException("View '" + prefix + "' not supported");
         }
 
-        Map<String, Object> map = new LinkedHashMap<>();
         if (names.equals("*")) {
+            Map<String, Object> map = new HashMap<>(9);
             map.put("lastModifiedTime", attrs.lastModifiedTime());
             map.put("lastAccessTime", attrs.lastAccessTime());
             map.put("creationTime", attrs.creationTime());
@@ -417,46 +409,46 @@ class ReadOnlyZipFileSystemProvider extends FileSystemProvider {
             map.put("isOther", attrs.isOther());
             map.put("size", attrs.size());
             map.put("fileKey", attrs.fileKey());
-        } else {
-            for (String name : names.split(",")) {
-                name = name.trim();
-                switch (name) {
-                    case "lastModifiedTime":
-                        map.put(name, attrs.lastModifiedTime());
-                        break;
-                    case "lastAccessTime":
-                        map.put(name, attrs.lastAccessTime());
-                        break;
-                    case "creationTime":
-                        map.put(name, attrs.creationTime());
-                        break;
-                    case "isRegularFile":
-                        map.put(name, attrs.isRegularFile());
-                        break;
-                    case "isDirectory":
-                        map.put(name, attrs.isDirectory());
-                        break;
-                    case "isSymbolicLink":
-                        map.put(name, attrs.isSymbolicLink());
-                        break;
-                    case "isOther":
-                        map.put(name, attrs.isOther());
-                        break;
-                    case "size":
-                        map.put(name, attrs.size());
-                        break;
-                    case "fileKey":
-                        map.put(name, attrs.fileKey());
-                        break;
-                    default:
-                        throw new IllegalArgumentException("Unknown attribute: " + name);
-                }
+            return map;
+        }
+        String[] requested = names.split(",");
+        Map<String, Object> map = new HashMap<>(requested.length * 2);
+        for (String name : requested) {
+            name = name.trim();
+            switch (name) {
+                case "lastModifiedTime":
+                    map.put(name, attrs.lastModifiedTime());
+                    break;
+                case "lastAccessTime":
+                    map.put(name, attrs.lastAccessTime());
+                    break;
+                case "creationTime":
+                    map.put(name, attrs.creationTime());
+                    break;
+                case "isRegularFile":
+                    map.put(name, attrs.isRegularFile());
+                    break;
+                case "isDirectory":
+                    map.put(name, attrs.isDirectory());
+                    break;
+                case "isSymbolicLink":
+                    map.put(name, attrs.isSymbolicLink());
+                    break;
+                case "isOther":
+                    map.put(name, attrs.isOther());
+                    break;
+                case "size":
+                    map.put(name, attrs.size());
+                    break;
+                case "fileKey":
+                    map.put(name, attrs.fileKey());
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown attribute: " + name);
             }
         }
         return map;
     }
-
-    // -- Inner classes --
 
     /**
      * An iterator over directory children that applies a filter and produces

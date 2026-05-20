@@ -38,6 +38,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.CRC32;
+import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 import org.junit.jupiter.api.Test;
@@ -183,6 +184,11 @@ class ReadOnlyZipFileSystemTest {
 
             assertTrue(Files.isRegularFile(fs.getPath("/file.txt")));
             assertFalse(Files.isRegularFile(fs.getPath("/dir")));
+
+            // trailing-slash paths must resolve the same as without
+            assertTrue(Files.exists(fs.getPath("/dir/")));
+            assertTrue(Files.isDirectory(fs.getPath("/dir/")));
+            assertEquals("inner", Files.readString(fs.getPath("/dir/inner.txt")));
         }
     }
 
@@ -921,6 +927,40 @@ class ReadOnlyZipFileSystemTest {
         }
     }
 
+    @Test
+    void inflateDynamicUsedWhenAllSizeSourcesAreZero() throws IOException {
+        // Non-empty content with non-zero CRC: the crc32==0 shortcut won't apply.
+        // Zero out uncompressed size in both headers and clear bit 3 so the data
+        // descriptor is not consulted — inflate must fall back to inflateDynamic.
+        byte[] content = new byte[10_000];
+        for (int i = 0; i < content.length; i++) {
+            content[i] = (byte) (i % 127 + 1);
+        }
+        Path zip = createZip("test.zip", entry("big.bin", content));
+        byte[] raw = Files.readAllBytes(zip);
+        patchCentralDirectoryUncompressedSize(raw, 0);
+        patchLocalHeaderUncompressedSize(raw, 0);
+        clearLocalHeaderDataDescriptorFlag(raw);
+        Path patched = tempDir.resolve("dynamic-inflate.zip");
+        Files.write(patched, raw);
+
+        try (FileSystem fs = ReadOnlyZipFileSystem.open(patched)) {
+            assertArrayEquals(content, Files.readAllBytes(fs.getPath("/big.bin")));
+        }
+    }
+
+    @Test
+    void deflatedEntryWithDataDescriptorProvidesUncompressedSize() throws IOException {
+        byte[] content = "data descriptor entry".getBytes(StandardCharsets.UTF_8);
+        byte[] raw = buildZipWithDataDescriptor("dd.txt", content);
+        Path zip = tempDir.resolve("data-descriptor.zip");
+        Files.write(zip, raw);
+
+        try (FileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
+            assertEquals("data descriptor entry", Files.readString(fs.getPath("/dd.txt")));
+        }
+    }
+
     // -- Non-ASCII (UTF-8) entry names --
 
     @Test
@@ -943,7 +983,11 @@ class ReadOnlyZipFileSystemTest {
         Path zip = createZip("uri.zip",
                 entry("with space.txt", "s"),
                 entry("file#1.txt", "h"),
-                entry("café.txt", "c"));
+                entry("café.txt", "c"),
+                entry("q?mark.txt", "q"),
+                entry("pct%val.txt", "p"),
+                entry("a&b=c.txt", "a"),
+                entry("dir/nested file.txt", "n"));
 
         try (FileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
             java.net.URI spaceUri = fs.getPath("/with space.txt").toUri();
@@ -958,6 +1002,34 @@ class ReadOnlyZipFileSystemTest {
             assertNotNull(cafeUri);
             assertTrue(cafeUri.toString().contains("café.txt"),
                     "Non-ASCII is valid in IRIs: " + cafeUri);
+
+            java.net.URI questionUri = fs.getPath("/q?mark.txt").toUri();
+            assertTrue(questionUri.toString().contains("q%3Fmark.txt"),
+                    "Question mark should be percent-encoded: " + questionUri);
+
+            java.net.URI pctUri = fs.getPath("/pct%val.txt").toUri();
+            assertTrue(pctUri.toString().contains("pct%25val.txt"),
+                    "Percent sign should be percent-encoded: " + pctUri);
+
+            java.net.URI ampUri = fs.getPath("/a&b=c.txt").toUri();
+            assertTrue(ampUri.toString().contains("a&b=c.txt"),
+                    "Ampersand and equals are valid URI chars: " + ampUri);
+
+            java.net.URI nestedUri = fs.getPath("/dir/nested file.txt").toUri();
+            assertTrue(nestedUri.toString().contains("dir/nested%20file.txt"),
+                    "Nested path should preserve slashes and encode spaces: " + nestedUri);
+        }
+    }
+
+    @Test
+    void toUriProducesValidJarScheme() throws IOException {
+        Path zip = createZip("uri.zip", entry("a.txt", "a"));
+        try (FileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
+            java.net.URI uri = fs.getPath("/a.txt").toUri();
+            assertTrue(uri.toString().startsWith("jar:file:"),
+                    "URI should start with jar:file: " + uri);
+            assertTrue(uri.toString().contains("!/a.txt"),
+                    "URI should contain !/ separator: " + uri);
         }
     }
 
@@ -1335,6 +1407,21 @@ class ReadOnlyZipFileSystemTest {
         writeLeUint32(zip, cdOff + 24, newSize);
     }
 
+    private static void clearLocalHeaderDataDescriptorFlag(byte[] zip) {
+        if (readLeInt32(zip, 0) != 0x04034b50) {
+            throw new IllegalStateException("Not a local file header at offset 0");
+        }
+        // Clear bit 3 of the general-purpose flags at local header offset 6
+        zip[6] = (byte) (zip[6] & ~0x08);
+    }
+
+    private static void patchLocalHeaderUncompressedSize(byte[] zip, long newSize) {
+        if (readLeInt32(zip, 0) != 0x04034b50) {
+            throw new IllegalStateException("Not a local file header at offset 0");
+        }
+        writeLeUint32(zip, 22, newSize);
+    }
+
     private static long findCentralDirectoryCompressedSize(byte[] zip) {
         int cdOff = findCentralDirectoryOffset(zip);
         return readLeUint32(zip, cdOff + 20);
@@ -1560,6 +1647,97 @@ class ReadOnlyZipFileSystemTest {
         eocd.putShort((short) 0);
         eocd.putShort((short) 1); // entries on this disk
         eocd.putShort((short) 1); // total entries
+        eocd.putInt((int) cdSize);
+        eocd.putInt((int) cdOffset);
+        eocd.putShort((short) 0);
+        out.write(eocd.array());
+
+        return out.toByteArray();
+    }
+
+    /**
+     * Builds a minimal DEFLATED ZIP archive with one entry that uses a data
+     * descriptor (general-purpose bit 3 set). Sizes and CRC are zeroed in both
+     * the local and central directory headers; the actual values appear only in
+     * the data descriptor following the compressed data.
+     */
+    private static byte[] buildZipWithDataDescriptor(String entryName, byte[] data) throws IOException {
+        byte[] nameBytes = entryName.getBytes(StandardCharsets.UTF_8);
+
+        CRC32 crc = new CRC32();
+        crc.update(data);
+        long crcValue = crc.getValue();
+
+        Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION, true);
+        deflater.setInput(data);
+        deflater.finish();
+        byte[] compBuf = new byte[data.length + 256];
+        int compLen = deflater.deflate(compBuf);
+        deflater.end();
+        byte[] compressed = new byte[compLen];
+        System.arraycopy(compBuf, 0, compressed, 0, compLen);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        // -- Local file header (sizes and CRC zeroed, bit 3 set) --
+        ByteBuffer local = ByteBuffer.allocate(30 + nameBytes.length)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        local.putInt(0x04034b50);
+        local.putShort((short) 20); // version needed
+        local.putShort((short) 0x08); // flags: bit 3 = data descriptor
+        local.putShort((short) 8); // method: DEFLATED
+        local.putShort((short) 0); // DOS time
+        local.putShort((short) 0); // DOS date
+        local.putInt(0); // CRC-32 (deferred to data descriptor)
+        local.putInt(0); // compressed size (deferred)
+        local.putInt(0); // uncompressed size (deferred)
+        local.putShort((short) nameBytes.length);
+        local.putShort((short) 0); // extra field length
+        local.put(nameBytes);
+        out.write(local.array());
+        out.write(compressed);
+
+        // -- Data descriptor (with signature) --
+        ByteBuffer dd = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
+        dd.putInt(0x08074b50); // data descriptor signature
+        dd.putInt((int) crcValue);
+        dd.putInt(compLen); // compressed size
+        dd.putInt(data.length); // uncompressed size
+        out.write(dd.array());
+
+        // -- Central directory (sizes zeroed, bit 3 set) --
+        long cdOffset = out.size();
+        ByteBuffer cd = ByteBuffer.allocate(46 + nameBytes.length)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        cd.putInt(CENTRAL_DIR_SIG);
+        cd.putShort((short) 20); // version made by
+        cd.putShort((short) 20); // version needed
+        cd.putShort((short) 0x08); // flags: bit 3
+        cd.putShort((short) 8); // method: DEFLATED
+        cd.putShort((short) 0); // DOS time
+        cd.putShort((short) 0); // DOS date
+        cd.putInt((int) crcValue); // CRC-32 (required for verification)
+        cd.putInt(compLen); // compressed size (required to read data)
+        cd.putInt(0); // uncompressed size (zeroed)
+        cd.putShort((short) nameBytes.length);
+        cd.putShort((short) 0); // extra field length
+        cd.putShort((short) 0); // comment length
+        cd.putShort((short) 0); // disk number start
+        cd.putShort((short) 0); // internal attrs
+        cd.putInt(0); // external attrs
+        cd.putInt(0); // local header offset
+        cd.put(nameBytes);
+        out.write(cd.array());
+
+        long cdSize = out.size() - cdOffset;
+
+        // -- EOCD --
+        ByteBuffer eocd = ByteBuffer.allocate(22).order(ByteOrder.LITTLE_ENDIAN);
+        eocd.putInt(0x06054b50);
+        eocd.putShort((short) 0);
+        eocd.putShort((short) 0);
+        eocd.putShort((short) 1);
+        eocd.putShort((short) 1);
         eocd.putInt((int) cdSize);
         eocd.putInt((int) cdOffset);
         eocd.putShort((short) 0);
