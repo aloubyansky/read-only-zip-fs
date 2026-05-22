@@ -28,6 +28,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CyclicBarrier;
@@ -41,6 +42,7 @@ import java.util.zip.CRC32;
 import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -51,6 +53,13 @@ class ReadOnlyZipFileSystemTest {
 
     @TempDir
     Path tempDir;
+
+    @AfterEach
+    void resetStats() {
+        RozipStats.ENABLED = false;
+        ReadOnlyZipFileSystem.CACHE_ENABLED = false;
+        RozipStats.reset();
+    }
 
     // -- Entry reading --
 
@@ -866,6 +875,24 @@ class ReadOnlyZipFileSystemTest {
         });
     }
 
+    @Test
+    void unsupportedCompressionMethodThrows() throws IOException {
+        Path zip = createZip("test.zip", entry("f.txt", "hello"));
+        byte[] raw = Files.readAllBytes(zip);
+        int cdOff = findCentralDirectoryOffset(raw);
+        // patch compression method (offset 10 in CEN header) to 9 (deflate64)
+        raw[cdOff + 10] = 9;
+        raw[cdOff + 11] = 0;
+        Path patched = tempDir.resolve("unsupported-method.zip");
+        Files.write(patched, raw);
+
+        try (FileSystem fs = ReadOnlyZipFileSystem.open(patched)) {
+            IOException ex = assertThrows(IOException.class,
+                    () -> Files.readAllBytes(fs.getPath("/f.txt")));
+            assertTrue(ex.getMessage().contains("Unsupported compression method"), ex.getMessage());
+        }
+    }
+
     // -- Zip bomb protection --
 
     @Test
@@ -958,6 +985,18 @@ class ReadOnlyZipFileSystemTest {
 
         try (FileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
             assertEquals("data descriptor entry", Files.readString(fs.getPath("/dd.txt")));
+        }
+    }
+
+    @Test
+    void zip64EntryWithDataDescriptorProvidesUncompressedSize() throws IOException {
+        byte[] content = "zip64 data descriptor entry".getBytes(StandardCharsets.UTF_8);
+        byte[] raw = buildZip64WithDataDescriptor("dd64.txt", content);
+        Path zip = tempDir.resolve("zip64-data-descriptor.zip");
+        Files.write(zip, raw);
+
+        try (FileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
+            assertEquals("zip64 data descriptor entry", Files.readString(fs.getPath("/dd64.txt")));
         }
     }
 
@@ -1318,6 +1357,111 @@ class ReadOnlyZipFileSystemTest {
     }
 
     // -- Helper methods --
+
+    // -- Stats instrumentation --
+
+    @Test
+    void statsTracksReadCounts() throws IOException {
+        RozipStats.ENABLED = true;
+        Path zip = createZip("stats.zip",
+                entry("a.txt", "alpha"),
+                entry("b.txt", "bravo"),
+                entry("dir/c.txt", "charlie"));
+
+        try (ReadOnlyZipFileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
+            fs.readEntryData("a.txt");
+            fs.readEntryData("a.txt");
+            fs.readEntryData("b.txt");
+        }
+
+        List<RozipStats.Snapshot> snapshots = RozipStats.completedSnapshots();
+        assertEquals(1, snapshots.size());
+        RozipStats.Snapshot s = snapshots.get(0);
+
+        assertEquals(3, s.totalReads());
+        assertEquals(2, s.uniqueReads());
+        assertEquals(2, s.entryReadCounts().get("a.txt"));
+        assertEquals(1, s.entryReadCounts().get("b.txt"));
+        assertNull(s.entryReadCounts().get("dir/c.txt"));
+        assertTrue(s.totalBytesDecompressed() > 0);
+        assertTrue(s.rafSyncNanos() > 0);
+        assertEquals(3, s.centralDirectoryEntryCount());
+        assertTrue(s.archivePath().contains("stats.zip"));
+    }
+
+    @Test
+    void cacheReturnsIdenticalContent() throws IOException {
+        ReadOnlyZipFileSystem.CACHE_ENABLED = true;
+        Path zip = createZip("cache.zip",
+                entry("a.txt", "alpha"),
+                entry("b.txt", "bravo"));
+
+        try (ReadOnlyZipFileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
+            byte[] first = fs.readEntryData("a.txt");
+            byte[] second = fs.readEntryData("a.txt");
+            assertArrayEquals(first, second);
+
+            byte[] b1 = fs.readEntryData("b.txt");
+            assertFalse(Arrays.equals(first, b1));
+        }
+    }
+
+    @Test
+    void cacheHitsTrackedInStats() throws IOException {
+        ReadOnlyZipFileSystem.CACHE_ENABLED = true;
+        RozipStats.ENABLED = true;
+        Path zip = createZip("cachestats.zip",
+                entry("a.txt", "alpha"),
+                entry("b.txt", "bravo"));
+
+        try (ReadOnlyZipFileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
+            fs.readEntryData("a.txt");
+            fs.readEntryData("a.txt");
+            fs.readEntryData("a.txt");
+            fs.readEntryData("b.txt");
+        }
+
+        List<RozipStats.Snapshot> snapshots = RozipStats.completedSnapshots();
+        assertEquals(1, snapshots.size());
+        RozipStats.Snapshot s = snapshots.get(0);
+        assertEquals(4, s.totalReads());
+        assertEquals(2, s.cacheHits());
+        assertTrue(s.totalBytesDecompressed() > 0);
+    }
+
+    @Test
+    void statsDisabledByDefault() throws IOException {
+        Path zip = createZip("nostats.zip",
+                entry("a.txt", "alpha"));
+
+        try (ReadOnlyZipFileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
+            fs.readEntryData("a.txt");
+        }
+
+        assertTrue(RozipStats.completedSnapshots().isEmpty());
+    }
+
+    @Test
+    void statsAcrossMultipleFilesystems() throws IOException {
+        RozipStats.ENABLED = true;
+        Path zip1 = createZip("stats1.zip", entry("x.txt", "one"));
+        Path zip2 = createZip("stats2.zip", entry("y.txt", "two"));
+
+        try (ReadOnlyZipFileSystem fs1 = ReadOnlyZipFileSystem.open(zip1)) {
+            fs1.readEntryData("x.txt");
+        }
+        try (ReadOnlyZipFileSystem fs2 = ReadOnlyZipFileSystem.open(zip2)) {
+            fs2.readEntryData("y.txt");
+            fs2.readEntryData("y.txt");
+        }
+
+        List<RozipStats.Snapshot> snapshots = RozipStats.completedSnapshots();
+        assertEquals(2, snapshots.size());
+
+        long totalReadsAcrossAll = snapshots.stream()
+                .mapToLong(RozipStats.Snapshot::totalReads).sum();
+        assertEquals(3, totalReadsAcrossAll);
+    }
 
     private Path createZip(String name, TestEntry... entries) throws IOException {
         return createZipWithMethod(name, ZipEntry.DEFLATED, entries);
@@ -1740,6 +1884,123 @@ class ReadOnlyZipFileSystemTest {
         eocd.putShort((short) 1);
         eocd.putInt((int) cdSize);
         eocd.putInt((int) cdOffset);
+        eocd.putShort((short) 0);
+        out.write(eocd.array());
+
+        return out.toByteArray();
+    }
+
+    /**
+     * Builds a minimal ZIP64 DEFLATED archive with one entry that uses a
+     * data descriptor with 64-bit fields. Version needed is 45 (ZIP64),
+     * sizes are zeroed in both headers, and the actual values appear only
+     * in the ZIP64 data descriptor.
+     */
+    private static byte[] buildZip64WithDataDescriptor(String entryName, byte[] data) throws IOException {
+        byte[] nameBytes = entryName.getBytes(StandardCharsets.UTF_8);
+
+        CRC32 crc = new CRC32();
+        crc.update(data);
+        long crcValue = crc.getValue();
+
+        Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION, true);
+        deflater.setInput(data);
+        deflater.finish();
+        byte[] compBuf = new byte[data.length + 256];
+        int compLen = deflater.deflate(compBuf);
+        deflater.end();
+        byte[] compressed = new byte[compLen];
+        System.arraycopy(compBuf, 0, compressed, 0, compLen);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        // -- Local file header (version 45, bit 3 set, sizes zeroed) --
+        ByteBuffer local = ByteBuffer.allocate(30 + nameBytes.length)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        local.putInt(0x04034b50);
+        local.putShort((short) 45); // version needed (ZIP64)
+        local.putShort((short) 0x08); // flags: bit 3 = data descriptor
+        local.putShort((short) 8); // method: DEFLATED
+        local.putShort((short) 0); // DOS time
+        local.putShort((short) 0); // DOS date
+        local.putInt(0); // CRC-32 (deferred)
+        local.putInt(0); // compressed size (deferred)
+        local.putInt(0); // uncompressed size (deferred)
+        local.putShort((short) nameBytes.length);
+        local.putShort((short) 0); // extra field length
+        local.put(nameBytes);
+        out.write(local.array());
+        out.write(compressed);
+
+        // -- ZIP64 data descriptor (with signature) --
+        // signature(4) + crc32(4) + compressedSize(8) + uncompressedSize(8)
+        ByteBuffer dd = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
+        dd.putInt(0x08074b50); // data descriptor signature
+        dd.putInt((int) crcValue);
+        dd.putLong(compLen); // compressed size (64-bit)
+        dd.putLong(data.length); // uncompressed size (64-bit)
+        out.write(dd.array());
+
+        // -- Central directory (ZIP64 sentinels + extra field, bit 3 set) --
+        long cdOffset = out.size();
+        byte[] cdExtra = buildZip64ExtraFieldWithOffset(0, 0, 0);
+        ByteBuffer cd = ByteBuffer.allocate(46 + nameBytes.length + cdExtra.length)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        cd.putInt(CENTRAL_DIR_SIG);
+        cd.putShort((short) 45); // version made by
+        cd.putShort((short) 45); // version needed
+        cd.putShort((short) 0x08); // flags: bit 3
+        cd.putShort((short) 8); // method: DEFLATED
+        cd.putShort((short) 0); // DOS time
+        cd.putShort((short) 0); // DOS date
+        cd.putInt((int) crcValue);
+        cd.putInt(compLen); // compressed size (needed to read data)
+        cd.putInt(0); // uncompressed size (zeroed — resolved from data descriptor)
+        cd.putShort((short) nameBytes.length);
+        cd.putShort((short) cdExtra.length);
+        cd.putShort((short) 0); // comment length
+        cd.putShort((short) 0); // disk number start
+        cd.putShort((short) 0); // internal attrs
+        cd.putInt(0); // external attrs
+        cd.putInt(0xFFFFFFFF); // local header offset (ZIP64 sentinel)
+        cd.put(nameBytes);
+        cd.put(cdExtra);
+        out.write(cd.array());
+
+        long cdSize = out.size() - cdOffset;
+
+        // -- ZIP64 EOCD --
+        long zip64EocdOffset = out.size();
+        ByteBuffer zip64Eocd = ByteBuffer.allocate(56).order(ByteOrder.LITTLE_ENDIAN);
+        zip64Eocd.putInt(0x06064b50);
+        zip64Eocd.putLong(44);
+        zip64Eocd.putShort((short) 45);
+        zip64Eocd.putShort((short) 45);
+        zip64Eocd.putInt(0);
+        zip64Eocd.putInt(0);
+        zip64Eocd.putLong(1);
+        zip64Eocd.putLong(1);
+        zip64Eocd.putLong(cdSize);
+        zip64Eocd.putLong(cdOffset);
+        out.write(zip64Eocd.array());
+
+        // -- ZIP64 EOCD locator --
+        ByteBuffer locator = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN);
+        locator.putInt(0x07064b50);
+        locator.putInt(0);
+        locator.putLong(zip64EocdOffset);
+        locator.putInt(1);
+        out.write(locator.array());
+
+        // -- EOCD --
+        ByteBuffer eocd = ByteBuffer.allocate(22).order(ByteOrder.LITTLE_ENDIAN);
+        eocd.putInt(0x06054b50);
+        eocd.putShort((short) 0);
+        eocd.putShort((short) 0);
+        eocd.putShort((short) 0xFFFF);
+        eocd.putShort((short) 0xFFFF);
+        eocd.putInt(0xFFFFFFFF);
+        eocd.putInt(0xFFFFFFFF);
         eocd.putShort((short) 0);
         out.write(eocd.array());
 
