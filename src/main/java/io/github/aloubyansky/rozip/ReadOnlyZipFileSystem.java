@@ -352,10 +352,30 @@ public class ReadOnlyZipFileSystem extends FileSystem {
      * @param entryName the entry name
      * @return {@code true} if the entry exists
      */
-    boolean entryExists(String entryName) {
+    public boolean entryExists(String entryName) {
         ensureOpen();
-        return ZipEntryInfo.ROOT_ENTRY_NAME.equals(entryName)
-                || entryTable.exists(entryName);
+        entryName = normalizeEntryName(entryName);
+        return entryName.isEmpty() || entryTable.exists(entryName);
+    }
+
+    /**
+     * Strips a leading and/or trailing {@code '/'} from an entry name,
+     * converting path-style names (e.g. {@code "/com/example/"}) to the
+     * slash-free form used by {@link CompactEntryTable} (e.g.
+     * {@code "com/example"}). Returns the empty string for the root
+     * ({@code "/"} or {@code ""}).
+     */
+    static String normalizeEntryName(String name) {
+        if (name.isEmpty()) {
+            return name;
+        }
+        if (name.charAt(0) == '/') {
+            if (name.length() == 1) {
+                return ZipEntryInfo.ROOT_ENTRY_NAME;
+            }
+            return name.charAt(name.length() - 1) == '/' ? name.substring(1, name.length() - 1) : name.substring(1);
+        }
+        return name.charAt(name.length() - 1) == '/' ? name.substring(0, name.length() - 1) : name;
     }
 
     /**

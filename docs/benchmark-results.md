@@ -1,6 +1,6 @@
 # Benchmark Results
 
-Measurements taken with rozip `0.0.4-SNAPSHOT` (compact CEN, opt-in entry caching) against Quarkus `999-SNAPSHOT` on JDK 21, Linux 7.0.9.
+Measurements taken with rozip against Quarkus `999-SNAPSHOT` on JDK 21, Linux.
 
 ## Phase 0: Instrumentation Data
 
@@ -113,6 +113,54 @@ Comparison of rozip (default config, no entry cache) against the JDK's default `
 
 Peak heap varies significantly across runs (up to 28% range for rest-fights). Median-of-5 is used above for stability.
 
+## Construction Optimizations
+
+Replaced `Integer[]` index sort with `int[]` merge sort (alternating buffers), and `byte[][]` per-name allocation with `(offset, length)` pairs into the central directory byte buffer. Measured via `-Drozip.stats=true` open timing across 1,346 filesystems with 308K total entries.
+
+### Filesystem Open Time (rest-fights, 7 warm runs, drop coldest)
+
+| Metric | Before | After | Delta |
+|---|---|---|---|
+| Median | 981 ms | 909 ms | **-7%** |
+| Mean | 1004 ms | 901 ms | -10% |
+| Range | [788, 1413] ms | [805, 1027] ms | tighter variance |
+
+Per-JAR times (1–15 ms) are I/O-dominated; the construction CPU cost is a fraction of total open time. The tighter variance suggests reduced GC interference from fewer transient allocations.
+
+## Direct `entryExists()` in Quarkus
+
+Quarkus's `ArchivePathTree.OpenArchivePathTree` uses `ReadOnlyZipFileSystem.entryExists()` directly instead of going through NIO for entry existence checks. This bypasses `Path.resolve()` → `Files.exists()` → provider dispatch → `checkAccess()` in four methods: `contains()`, `apply()`, `accept()`, and `getPath()`. The interrupt flag handling (`Thread.interrupted()` + restore) was also removed since rozip uses `RandomAccessFile`, which is not interruptible.
+
+Tree walking (`walk()`, `walkIfContains()`) and entry reads (`Files.readAllBytes()`, `Files.newInputStream()`) still go through NIO — walk visitors depend on `PathVisit.getPath()` returning a real NIO Path for I/O operations, so bypassing NIO there would require changing the `PathVisit` contract.
+
+### Build Time: rest-fights `mvn package` (5 runs)
+
+| Metric | NIO path | Direct `entryExists()` | Delta |
+|---|---|---|---|
+| Mean | 18.00s | 17.55s | **-2.5%** |
+| Median | 18.04s | 17.54s | -2.8% |
+| Range | [17.47, 18.57] | [17.39, 17.69] | tighter variance |
+
+### Build + Test Time: 4 quickstarts `mvn verify` (3 runs)
+
+getting-started, config-quickstart, rest-client-quickstart, validation-quickstart — each includes `@QuarkusTest` augmentation + test bootstrap.
+
+| Metric | NIO path | Direct `entryExists()` | Delta |
+|---|---|---|---|
+| Mean | 46.59s | 45.15s | **-3.1%** |
+| Run 1 | 45.57s | 43.97s | -3.5% |
+| Run 2 | 46.48s | 45.51s | -2.1% |
+| Run 3 | 47.72s | 45.96s | -3.7% |
+
+### GC Pauses (rest-fights, runs 2–5)
+
+| Metric | NIO path | Direct `entryExists()` |
+|---|---|---|
+| Mean | 61.3 ms | 62.0 ms |
+| Median | 59.3 ms | 60.8 ms |
+
+GC pauses are identical — the savings are CPU-side (fewer method calls, no Path/provider dispatch), not allocation-side.
+
 ## Benchmark Projects
 
 | Project | Location | Description |
@@ -127,7 +175,7 @@ Peak heap varies significantly across runs (up to 28% range for rest-fights). Me
 - JDK: 21
 - OS: Linux 7.0.9-104.fc43.x86_64
 - Quarkus: 999-SNAPSHOT (local build)
-- Rozip: 0.0.4-SNAPSHOT
+- Rozip: 0.0.5-SNAPSHOT (construction optimizations, direct API)
 - Heap: default (no -Xmx constraint)
 - JFR settings: profile
 - All metrics: median of 5 runs

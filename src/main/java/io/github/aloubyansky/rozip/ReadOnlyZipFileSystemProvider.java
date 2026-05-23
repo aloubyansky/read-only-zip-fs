@@ -343,17 +343,7 @@ class ReadOnlyZipFileSystemProvider extends FileSystemProvider {
      *         for root)
      */
     private static String toEntryName(Path path) {
-        String s = path.toAbsolutePath().normalize().toString();
-        if (s.isEmpty()) {
-            return s;
-        }
-        if (s.charAt(0) == '/') {
-            if (s.length() == 1) {
-                return ZipEntryInfo.ROOT_ENTRY_NAME;
-            }
-            return s.charAt(s.length() - 1) == '/' ? s.substring(1, s.length() - 1) : s.substring(1);
-        }
-        return s.charAt(s.length() - 1) == '/' ? s.substring(0, s.length() - 1) : s;
+        return ReadOnlyZipFileSystem.normalizeEntryName(path.toAbsolutePath().normalize().toString());
     }
 
     /**

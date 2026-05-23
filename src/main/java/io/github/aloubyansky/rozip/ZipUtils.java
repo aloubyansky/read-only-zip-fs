@@ -30,4 +30,5 @@ public class ZipUtils {
     public static FileSystem newReadOnlyFileSystem(Path path) throws IOException {
         return ReadOnlyZipFileSystem.open(path);
     }
+
 }

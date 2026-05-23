@@ -1356,6 +1356,37 @@ class ReadOnlyZipFileSystemTest {
         }
     }
 
+    // -- Direct API --
+
+    @Test
+    void entryExistsDirectApi() throws IOException {
+        Path zip = createZip("test.zip",
+                entry("a.txt", "alpha"),
+                entry("dir/b.txt", "bravo"));
+
+        try (ReadOnlyZipFileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
+            assertTrue(fs.entryExists("a.txt"));
+            assertTrue(fs.entryExists("dir/b.txt"));
+            assertTrue(fs.entryExists("dir"));
+            assertTrue(fs.entryExists(""));
+            assertFalse(fs.entryExists("missing.txt"));
+            assertFalse(fs.entryExists("dir/missing.txt"));
+        }
+    }
+
+    @Test
+    void entryExistsWithTrailingSlash() throws IOException {
+        Path zip = createZip("test.zip",
+                entry("dir/file.txt", "content"));
+
+        try (ReadOnlyZipFileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
+            assertTrue(fs.entryExists("dir"));
+            assertTrue(fs.entryExists("dir/"));
+            assertTrue(fs.entryExists(""));
+            assertTrue(fs.entryExists("/"));
+        }
+    }
+
     // -- Helper methods --
 
     // -- Stats instrumentation --
