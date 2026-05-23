@@ -55,10 +55,8 @@ class ReadOnlyZipFileSystemTest {
     Path tempDir;
 
     @AfterEach
-    void resetStats() {
-        RozipStats.ENABLED = false;
+    void resetCache() {
         ReadOnlyZipFileSystem.CACHE_ENABLED = false;
-        RozipStats.reset();
     }
 
     // -- Entry reading --
@@ -1389,36 +1387,7 @@ class ReadOnlyZipFileSystemTest {
 
     // -- Helper methods --
 
-    // -- Stats instrumentation --
-
-    @Test
-    void statsTracksReadCounts() throws IOException {
-        RozipStats.ENABLED = true;
-        Path zip = createZip("stats.zip",
-                entry("a.txt", "alpha"),
-                entry("b.txt", "bravo"),
-                entry("dir/c.txt", "charlie"));
-
-        try (ReadOnlyZipFileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
-            fs.readEntryData("a.txt");
-            fs.readEntryData("a.txt");
-            fs.readEntryData("b.txt");
-        }
-
-        List<RozipStats.Snapshot> snapshots = RozipStats.completedSnapshots();
-        assertEquals(1, snapshots.size());
-        RozipStats.Snapshot s = snapshots.get(0);
-
-        assertEquals(3, s.totalReads());
-        assertEquals(2, s.uniqueReads());
-        assertEquals(2, s.entryReadCounts().get("a.txt"));
-        assertEquals(1, s.entryReadCounts().get("b.txt"));
-        assertNull(s.entryReadCounts().get("dir/c.txt"));
-        assertTrue(s.totalBytesDecompressed() > 0);
-        assertTrue(s.rafSyncNanos() > 0);
-        assertEquals(3, s.centralDirectoryEntryCount());
-        assertTrue(s.archivePath().contains("stats.zip"));
-    }
+    // -- Entry caching --
 
     @Test
     void cacheReturnsIdenticalContent() throws IOException {
@@ -1435,63 +1404,6 @@ class ReadOnlyZipFileSystemTest {
             byte[] b1 = fs.readEntryData("b.txt");
             assertFalse(Arrays.equals(first, b1));
         }
-    }
-
-    @Test
-    void cacheHitsTrackedInStats() throws IOException {
-        ReadOnlyZipFileSystem.CACHE_ENABLED = true;
-        RozipStats.ENABLED = true;
-        Path zip = createZip("cachestats.zip",
-                entry("a.txt", "alpha"),
-                entry("b.txt", "bravo"));
-
-        try (ReadOnlyZipFileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
-            fs.readEntryData("a.txt");
-            fs.readEntryData("a.txt");
-            fs.readEntryData("a.txt");
-            fs.readEntryData("b.txt");
-        }
-
-        List<RozipStats.Snapshot> snapshots = RozipStats.completedSnapshots();
-        assertEquals(1, snapshots.size());
-        RozipStats.Snapshot s = snapshots.get(0);
-        assertEquals(4, s.totalReads());
-        assertEquals(2, s.cacheHits());
-        assertTrue(s.totalBytesDecompressed() > 0);
-    }
-
-    @Test
-    void statsDisabledByDefault() throws IOException {
-        Path zip = createZip("nostats.zip",
-                entry("a.txt", "alpha"));
-
-        try (ReadOnlyZipFileSystem fs = ReadOnlyZipFileSystem.open(zip)) {
-            fs.readEntryData("a.txt");
-        }
-
-        assertTrue(RozipStats.completedSnapshots().isEmpty());
-    }
-
-    @Test
-    void statsAcrossMultipleFilesystems() throws IOException {
-        RozipStats.ENABLED = true;
-        Path zip1 = createZip("stats1.zip", entry("x.txt", "one"));
-        Path zip2 = createZip("stats2.zip", entry("y.txt", "two"));
-
-        try (ReadOnlyZipFileSystem fs1 = ReadOnlyZipFileSystem.open(zip1)) {
-            fs1.readEntryData("x.txt");
-        }
-        try (ReadOnlyZipFileSystem fs2 = ReadOnlyZipFileSystem.open(zip2)) {
-            fs2.readEntryData("y.txt");
-            fs2.readEntryData("y.txt");
-        }
-
-        List<RozipStats.Snapshot> snapshots = RozipStats.completedSnapshots();
-        assertEquals(2, snapshots.size());
-
-        long totalReadsAcrossAll = snapshots.stream()
-                .mapToLong(RozipStats.Snapshot::totalReads).sum();
-        assertEquals(3, totalReadsAcrossAll);
     }
 
     private Path createZip(String name, TestEntry... entries) throws IOException {

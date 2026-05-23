@@ -294,52 +294,6 @@ final class CompactEntryTable {
     }
 
     /**
-     * Returns the actual memory consumed by this table's arrays, in bytes.
-     */
-    long memoryUsageBytes() {
-        long bytes = 0;
-        bytes += 16 + nameBytes.length; // byte[] header + data
-        bytes += 16 + (long) nameOffsets.length * 4; // int[] header + data
-        bytes += 16 + (long) entryCount * 8; // localHeaderOffsets
-        bytes += 16 + (long) entryCount * 8; // compressedSizes
-        bytes += 16 + (long) entryCount * 8; // uncompressedSizes
-        bytes += 16 + (long) entryCount * 4; // crc32Values
-        bytes += 16 + (long) entryCount * 8; // lastModifiedTimes
-        bytes += 16 + entryCount; // compressionMethods
-        bytes += 16 + ((long) entryCount + 63) / 64 * 8; // BitSet (long[] backing)
-        bytes += 64; // CompactEntryTable object + field references
-        return bytes;
-    }
-
-    /**
-     * Estimates how much memory the equivalent {@code HashMap<String, ZipEntryInfo>}
-     * plus {@code HashMap<String, List<String>>} directory-children map would
-     * consume for the same entry set. Used for reporting the compact CEN savings.
-     */
-    long estimatedOldMemoryUsageBytes() {
-        long bytes = 0;
-        // HashMap overhead: array of buckets + Node objects
-        int buckets = Integer.highestOneBit(entryCount - 1) << 1;
-        if (buckets < 16)
-            buckets = 16;
-        bytes += 16 + (long) buckets * 8; // bucket array
-        bytes += (long) entryCount * 32; // HashMap.Node (header + hash + key + value + next)
-        // String keys
-        long totalNameBytes = nameOffsets[entryCount] - nameOffsets[0];
-        bytes += (long) entryCount * 40; // String object overhead (header + hash + coder + value ref)
-        bytes += (long) entryCount * 16 + totalNameBytes; // backing byte[] per String
-        // ZipEntryInfo record objects
-        bytes += (long) entryCount * 72; // record header + 8 fields + name reference
-        // directoryChildren map (estimated ~30% of entries are implicit/explicit dirs)
-        long dirCount = entryCount / 3;
-        bytes += dirCount * 32; // HashMap.Node per directory
-        bytes += dirCount * 50; // String keys for directory names
-        bytes += dirCount * 40; // ArrayList per directory
-        bytes += 48; // HashMap objects
-        return bytes;
-    }
-
-    /**
      * Looks up an entry by name. A new {@link ZipEntryInfo} is constructed
      * on each call from the parallel arrays; the caller's {@code name}
      * string is reused as the record's name field.

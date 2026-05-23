@@ -69,7 +69,6 @@ public class ReadOnlyZipFileSystem extends FileSystem {
     private static final int MAX_INFLATER_POOL_SIZE = 8;
     private final Deque<Inflater> inflaterPool = new ArrayDeque<>();
     private final ConcurrentHashMap<String, SoftReference<byte[]>> entryCache;
-    private final RozipStats.Tracker statsTracker;
 
     /**
      * Opens a read-only, non-interruptible filesystem for the given ZIP/JAR file.
@@ -86,12 +85,10 @@ public class ReadOnlyZipFileSystem extends FileSystem {
      * @throws IOException if the file cannot be read or is not a valid ZIP archive
      */
     public static ReadOnlyZipFileSystem open(Path zipFile) throws IOException {
-        long t0 = RozipStats.ENABLED ? System.nanoTime() : 0;
         RandomAccessFile raf = new RandomAccessFile(zipFile.toFile(), "r");
         try {
             ZipCentralDirectory cd = ZipCentralDirectory.parse(raf);
-            long openNanos = RozipStats.ENABLED ? System.nanoTime() - t0 : 0;
-            return new ReadOnlyZipFileSystem(zipFile, raf, cd, openNanos);
+            return new ReadOnlyZipFileSystem(zipFile, raf, cd);
         } catch (IOException | RuntimeException e) {
             try {
                 raf.close();
@@ -109,19 +106,13 @@ public class ReadOnlyZipFileSystem extends FileSystem {
      * @param raf an open file handle for reading entry data
      * @param cd the parsed central directory
      */
-    private ReadOnlyZipFileSystem(Path zipPath, RandomAccessFile raf, ZipCentralDirectory cd,
-            long openNanos) {
+    private ReadOnlyZipFileSystem(Path zipPath, RandomAccessFile raf, ZipCentralDirectory cd) {
         this.zipPath = zipPath;
         this.raf = raf;
         this.entryTable = cd.entryTable();
         this.entryCache = CACHE_ENABLED ? new ConcurrentHashMap<>() : null;
         this.rootPath = new ReadOnlyZipPath(this, "/");
         this.fileStore = new ReadOnlyZipFileStore(zipPath);
-        this.statsTracker = RozipStats.ENABLED
-                ? RozipStats.onOpen(zipPath, entryTable.size(),
-                        entryTable.memoryUsageBytes(), entryTable.estimatedOldMemoryUsageBytes(),
-                        openNanos)
-                : null;
     }
 
     /**
@@ -152,9 +143,6 @@ public class ReadOnlyZipFileSystem extends FileSystem {
             }
             if (entryCache != null) {
                 entryCache.clear();
-            }
-            if (statsTracker != null) {
-                RozipStats.onClose(statsTracker);
             }
         }
     }
@@ -422,18 +410,11 @@ public class ReadOnlyZipFileSystem extends FileSystem {
             throw new IOException("Cannot read data from directory entry: " + entryName);
         }
 
-        if (statsTracker != null) {
-            statsTracker.recordRead(entryName);
-        }
-
         if (entryCache != null) {
             SoftReference<byte[]> ref = entryCache.get(entryName);
             if (ref != null) {
                 byte[] cached = ref.get();
                 if (cached != null) {
-                    if (statsTracker != null) {
-                        statsTracker.recordCacheHit();
-                    }
                     return cached;
                 }
             }
@@ -443,9 +424,6 @@ public class ReadOnlyZipFileSystem extends FileSystem {
         byte[] result = decompress(ce, info);
         if (entryCache != null) {
             entryCache.put(entryName, new SoftReference<>(result));
-        }
-        if (statsTracker != null) {
-            statsTracker.recordBytes(result.length);
         }
         return result;
     }
@@ -483,39 +461,32 @@ public class ReadOnlyZipFileSystem extends FileSystem {
     private CompressedEntry readCompressedData(ZipEntryInfo info) throws IOException {
         // ensureOpen inside synchronized(raf) guarantees the file handle cannot
         // be closed between the check and the reads — close() also syncs on raf
-        long t0 = statsTracker != null ? System.nanoTime() : 0;
-        try {
-            synchronized (raf) {
-                ensureOpen();
-                raf.seek(info.localHeaderOffset());
-                byte[] localHeader = new byte[LOCAL_HEADER_FIXED_SIZE];
-                raf.readFully(localHeader);
-                validateLocalHeader(localHeader, info);
+        synchronized (raf) {
+            ensureOpen();
+            raf.seek(info.localHeaderOffset());
+            byte[] localHeader = new byte[LOCAL_HEADER_FIXED_SIZE];
+            raf.readFully(localHeader);
+            validateLocalHeader(localHeader, info);
 
-                long localUncompressedSize = LittleEndian.readUint32(localHeader, 22);
-                int nameLen = LittleEndian.readUint16(localHeader, 26);
-                int extraLen = LittleEndian.readUint16(localHeader, 28);
-                long dataOffset = info.localHeaderOffset() + LOCAL_HEADER_FIXED_SIZE + nameLen + extraLen;
+            long localUncompressedSize = LittleEndian.readUint32(localHeader, 22);
+            int nameLen = LittleEndian.readUint16(localHeader, 26);
+            int extraLen = LittleEndian.readUint16(localHeader, 28);
+            long dataOffset = info.localHeaderOffset() + LOCAL_HEADER_FIXED_SIZE + nameLen + extraLen;
 
-                raf.seek(dataOffset);
-                byte[] compressed = new byte[checkedCast(info.compressedSize())];
-                raf.readFully(compressed);
+            raf.seek(dataOffset);
+            byte[] compressed = new byte[checkedCast(info.compressedSize())];
+            raf.readFully(compressed);
 
-                long uncompressedSize = localUncompressedSize;
-                if (uncompressedSize == 0 && info.uncompressedSize() == 0) {
-                    int flags = LittleEndian.readUint16(localHeader, 6);
-                    if ((flags & 0x08) != 0) {
-                        boolean zip64 = LittleEndian.readUint16(localHeader, 4) >= 45;
-                        uncompressedSize = readDataDescriptorUncompressedSize(zip64);
-                    }
+            long uncompressedSize = localUncompressedSize;
+            if (uncompressedSize == 0 && info.uncompressedSize() == 0) {
+                int flags = LittleEndian.readUint16(localHeader, 6);
+                if ((flags & 0x08) != 0) {
+                    boolean zip64 = LittleEndian.readUint16(localHeader, 4) >= 45;
+                    uncompressedSize = readDataDescriptorUncompressedSize(zip64);
                 }
+            }
 
-                return new CompressedEntry(compressed, uncompressedSize);
-            }
-        } finally {
-            if (statsTracker != null) {
-                statsTracker.recordRafNanos(System.nanoTime() - t0);
-            }
+            return new CompressedEntry(compressed, uncompressedSize);
         }
     }
 
